@@ -142,6 +142,14 @@ python daily_report.py --since-experiment
 # Manual override — bandingkan periode custom tanpa perlu penanda
 python daily_report.py --since "2026-07-15"
 python daily_report.py --since "2026-07-15 14:00:00"
+
+# Ringkasan agregat sejak trade PERTAMA (sama seperti --since-experiment,
+# tapi tanpa batas tanggal — breakdown close_reason mencakup semua histori)
+python daily_report.py --all-time
+
+# List SETIAP trade satu per satu (bukan agregat) — untuk scroll/cek
+# trade tertentu, urut dari yang paling baru
+python daily_report.py --all-trades
 ```
 
 Laporan hasil `--since-experiment`/`--since` menampilkan breakdown per
@@ -207,20 +215,6 @@ Parameter yang dibekukan:
    "tiba-tiba terbalik". Kalau berulang, pertimbangkan turunkan
    threshold atau tambah aturan berbasis tren PnL (bukan cuma sinyal
    teknikal) di `make_thesis_review`.
-
-### Breakdown hasil sejauh ini (`--all-time`, hari pertama)
-
-```
-✅ TRAILING   5x | total $+17.87 | avg $+3.57  | WR 100%
-❌ SL         5x | total $-46.46 | avg $-9.29  | WR 0%
-✅ STAGNANT   3x | total $+0.31  | avg $+0.10  | WR 67%
-✅ TP         1x | total $+17.75 | avg $+17.75 | WR 100%
-```
-
-Tanpa grup SL, hari pertama sebenarnya profit +$35.93 — trailing stop
-dan stagnant breaker sama-sama berkontribusi positif bersih. Kerugian
-net murni datang dari kualitas 5 trade yang berujung SL, bukan dari
-mekanisme manajemen posisi.
 
 ---
 
