@@ -1,0 +1,58 @@
+# ============================================
+# SECRETS — JANGAN PERNAH commit file ini
+# ============================================
+.env
+.env.*
+!.env.example
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# ============================================
+# Database & state bot — hasil generate, bukan source code
+# ============================================
+bot_memory.db
+bot_memory.db-journal
+bot_memory.db-wal
+bot_memory.db-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.bak
+
+# Policy yang dipelajari post-mortem — regenerasi otomatis, tidak perlu di-track
+strategy_policy.txt
+
+# Penanda periode eksperimen (lihat daily_report.py --start-experiment)
+experiment_start.txt
+
+# ============================================
+# Logs
+# ============================================
+*.log
+bot.log
+logs/
+
+# ============================================
+# Editor / OS
+# ============================================
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
