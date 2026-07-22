@@ -178,13 +178,59 @@ semua order disimulasikan lokal, TIDAK ada order asli ke Binance.
 
 ---
 
+## Status Eksperimen Saat Ini
+
+Sedang berjalan: **uji 1 minggu dengan parameter dibekukan** — jangan
+ubah `config.py` apapun sampai periode ini selesai, supaya hasilnya bisa
+dievaluasi secara bersih (lihat `daily_report.py --since-experiment`).
+
+Parameter yang dibekukan:
+- `MIN_CONFIDENCE_TO_TRADE = 0.60`
+- `STOP_LOSS_PCT = 1.5`, `TAKE_PROFIT_PCT = 3.0`
+- `TRAILING_STOP_ACTIVATION = 1.0`, `TRAILING_STOP_CALLBACK = 0.5`
+- `MAX_HOLD_MINUTES = 60`, `STAGNANT_PNL_BAND_PCT = 2.0`
+- `THESIS_REVIEW_INTERVAL_MINUTES = 10`, `THESIS_REVIEW_MIN_CONFIDENCE = 0.65`
+
+### Temuan yang disimpan untuk evaluasi akhir minggu (belum ditindaklanjuti)
+
+1. **Re-entry ke pair yang baru saja kena SL di hari yang sama** —
+   pernah terjadi pada PROMUSDT (2x SL, total -$12.76) dan 1000XECUSDT
+   (2x, net -$4.80). Cooldown SL saat ini global (15 menit, semua
+   symbol), bukan per-symbol. Pertimbangkan cooldown lebih panjang
+   khusus untuk symbol yang sama kalau pola ini konsisten muncul.
+2. **Thesis review konsisten `HOLD` pada posisi yang memburuk perlahan
+   tapi pasti** — kasus ONEUSDT: PnL menurun bertahap dari -1.4% sampai
+   akhirnya SL di -9.6%, tapi setiap review sepanjang perjalanan itu
+   selalu `HOLD` (beda dengan USUSDT yang berhasil `TIGHTEN_SL` saat
+   tesis terbalik jelas). Dugaan: `THESIS_REVIEW_MIN_CONFIDENCE = 0.65`
+   kurang sensitif untuk pola "perlahan tapi pasti" dibanding pola
+   "tiba-tiba terbalik". Kalau berulang, pertimbangkan turunkan
+   threshold atau tambah aturan berbasis tren PnL (bukan cuma sinyal
+   teknikal) di `make_thesis_review`.
+
+### Breakdown hasil sejauh ini (`--all-time`, hari pertama)
+
+```
+✅ TRAILING   5x | total $+17.87 | avg $+3.57  | WR 100%
+❌ SL         5x | total $-46.46 | avg $-9.29  | WR 0%
+✅ STAGNANT   3x | total $+0.31  | avg $+0.10  | WR 67%
+✅ TP         1x | total $+17.75 | avg $+17.75 | WR 100%
+```
+
+Tanpa grup SL, hari pertama sebenarnya profit +$35.93 — trailing stop
+dan stagnant breaker sama-sama berkontribusi positif bersih. Kerugian
+net murni datang dari kualitas 5 trade yang berujung SL, bukan dari
+mekanisme manajemen posisi.
+
+---
+
 ## Hal-hal Penting untuk Diingat
 
 - **`MIN_CONFIDENCE_TO_TRADE`** sempat diturunkan ke 0.40 untuk fase
-  belajar (lebih banyak data untuk post-mortem, konsekuensinya win rate
-  lebih rendah). Rencana: uji minimal 1 minggu dengan parameter
-  dibekukan, evaluasi via `daily_report.py --since-experiment` (fokus ke
-  breakdown `close_reason`, bukan cuma win rate), baru putuskan naik/turun.
+  belajar awal (lebih banyak data untuk post-mortem), lalu dinaikkan
+  lagi ke 0.60 dan dibekukan untuk uji 1 minggu — lihat
+  [Status Eksperimen Saat Ini](#status-eksperimen-saat-ini) untuk
+  parameter lengkap dan progress terkini.
 - **PAPER mode tidak punya order stop asli di exchange** — SL/TP/trailing
   murni hasil polling bot sendiri. Ini kenapa monitoring posisi harus di
   jadwal cepat (10 detik) — polling yang lambat pernah menyebabkan

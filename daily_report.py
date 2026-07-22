@@ -69,13 +69,17 @@ def generate_report() -> str:
         """, (today,))
         worst_row = cursor.fetchone()
 
-        # ── Pair paling sering di-trade ──
+        # ── SEMUA pair yang ditradingkan hari ini ──
+        # Sebelumnya ada LIMIT 5 dan ORDER BY count — dengan sebagian
+        # besar pair cuma ditradingkan 1x/hari, urutan by count jadi
+        # sewenang-wenang dan pair lain "hilang" dari laporan. Sekarang
+        # tampilkan SEMUA, diurutkan dari yang paling untung ke paling rugi.
         cursor.execute("""
             SELECT symbol, COUNT(*) as count, SUM(pnl_usdt) as total_pnl
             FROM trade_history
             WHERE DATE(timestamp) = ? AND status = 'CLOSED'
             GROUP BY symbol
-            ORDER BY count DESC LIMIT 5
+            ORDER BY total_pnl DESC
         """, (today,))
         top_pairs = cursor.fetchall()
 
@@ -145,8 +149,8 @@ def generate_report() -> str:
 💀 WORST TRADE HARI INI  
 {f"• {worst_row[0]} {worst_row[1]} | ${worst_row[2]:.2f} ({worst_row[3]:.1f}%) | {worst_row[4]} | {worst_row[5]} menit" if worst_row else "• Belum ada"}
 
-🎯 TOP PAIRS HARI INI
-{chr(10).join([f'• {p[0]}: {p[1]}x trade | PnL ${p[2]:.2f}' for p in top_pairs]) if top_pairs else '• Belum ada'}
+🎯 SEMUA PAIR HARI INI (urut dari paling untung)
+{chr(10).join([f"{'✅' if p[2] >= 0 else '❌'} {p[0]}: {p[1]}x trade | PnL ${p[2]:+.2f}" for p in top_pairs]) if top_pairs else '• Belum ada'}
 
 🔍 SCAN STATS
 - Total pair discan : {total_scanned}
@@ -328,6 +332,62 @@ def generate_range_report(start_iso: str, label: str = None) -> str:
 
     return report
 
+# ============================================
+# HISTORY LENGKAP — semua trade, bukan agregat
+# ============================================
+
+def generate_full_history() -> str:
+    """
+    List SETIAP trade yang pernah tercatat (OPEN maupun CLOSED), urut dari
+    yang PALING BARU. Beda dengan generate_range_report() yang meringkas
+    jadi statistik agregat — ini menampilkan baris per baris, untuk kamu
+    scroll/cek trade tertentu secara individual.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, timestamp, symbol, side, entry_price, exit_price,
+                   pnl_usdt, pnl_percent, status, close_reason, duration_mins,
+                   ai_confidence
+            FROM trade_history
+            ORDER BY id DESC
+        """)
+        rows = [dict(r) for r in cursor.fetchall()]
+
+    if not rows:
+        return "Belum ada trade sama sekali."
+
+    lines = []
+    for r in rows:
+        ts = r["timestamp"][:16].replace("T", " ")
+        if r["status"] == "OPEN":
+            lines.append(
+                f"#{r['id']:<4} {ts} | {r['symbol']:<12} {r['side']:<5} | "
+                f"OPEN @ {r['entry_price']:.6g} | conf {r['ai_confidence']:.0%}"
+            )
+        else:
+            emoji = "✅" if r["pnl_usdt"] >= 0 else "❌"
+            lines.append(
+                f"#{r['id']:<4} {ts} | {r['symbol']:<12} {r['side']:<5} | "
+                f"{emoji} ${r['pnl_usdt']:+.2f} ({r['pnl_percent']:+.1f}%) | "
+                f"{r['close_reason']:<14} | {r['duration_mins']}m | conf {r['ai_confidence']:.0%}"
+            )
+
+    total = len(rows)
+    closed = [r for r in rows if r["status"] == "CLOSED"]
+    wins = sum(1 for r in closed if r["pnl_usdt"] > 0)
+    total_pnl = sum(r["pnl_usdt"] for r in closed)
+    wr = (wins / len(closed) * 100) if closed else 0
+
+    header = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📜 HISTORY LENGKAP — {total} trade tercatat\n"
+        f"   ({len(closed)} closed, WR {wr:.1f}%, total PnL ${total_pnl:+.2f})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    return header + "\n" + "\n".join(lines)
+
 
 if __name__ == "__main__":
     init_db()
@@ -339,13 +399,23 @@ if __name__ == "__main__":
                          help="Generate laporan evaluasi sejak eksperimen terakhir ditandai")
     parser.add_argument("--since", type=str, default=None,
                          help="Generate laporan evaluasi sejak tanggal/waktu manual, format: 'YYYY-MM-DD' atau 'YYYY-MM-DD HH:MM:SS'")
+    parser.add_argument("--all-time", action="store_true",
+                         help="Laporan AGREGAT sejak trade pertama (breakdown close_reason, dst) — sama seperti --since tapi tanpa batas tanggal")
+    parser.add_argument("--all-trades", action="store_true",
+                         help="List SETIAP trade satu per satu (bukan agregat) — untuk cek history/trade tertentu")
     args = parser.parse_args()
 
     if args.start_experiment:
         mark_experiment_start()
         sys.exit(0)
 
-    if args.since_experiment:
+    if args.all_trades:
+        print(generate_full_history())
+        sys.exit(0)
+
+    if args.all_time:
+        report = generate_range_report("1970-01-01T00:00:00", label="Sejak trade pertama (semua waktu)")
+    elif args.since_experiment:
         start_iso = _read_experiment_start()
         report = generate_range_report(start_iso, label="Eksperimen (parameter dibekukan)")
     elif args.since:
