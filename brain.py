@@ -1,5 +1,6 @@
 import json
 import os
+import math
 from datetime import datetime
 import config
 import memory
@@ -29,8 +30,15 @@ STRATEGY POLICY (Default — belum ada data trade):
     with open(STRATEGY_FILE, "r") as f:
         return f.read()
 
-def update_strategy_policy(new_policy: str):
-    """Update strategy policy dari hasil post-mortem + simpan history ke DB"""
+def update_strategy_policy(new_policy: str, snapshot: dict = None):
+    """
+    Update strategy policy dari hasil post-mortem + simpan history ke DB.
+
+    snapshot: hasil memory.get_performance_snapshot() SEBELUM update ini —
+    disimpan bersama policy baru supaya nanti bisa diverifikasi apakah
+    policy ini BENAR memperbaiki hasil (bandingkan dengan snapshot window
+    berikutnya), bukan cuma diasumsikan lebih baik oleh AI.
+    """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     content   = f"[Updated: {timestamp}]\n{new_policy}"
     with open(STRATEGY_FILE, "w") as f:
@@ -39,10 +47,16 @@ def update_strategy_policy(new_policy: str):
     # Simpan juga ke tabel strategy_log supaya history policy tidak hilang
     # (tabel ini sudah ada di memory.init_db tapi sebelumnya tidak pernah dipakai)
     try:
+        snapshot = snapshot or {}
         with memory.get_db() as conn:
             conn.execute(
-                "INSERT INTO strategy_log (timestamp, policy, source) VALUES (?, ?, 'post_mortem')",
-                (datetime.now().isoformat(), new_policy)
+                """INSERT INTO strategy_log
+                   (timestamp, policy, source, win_rate_before, avg_pnl_pct_before, sample_size)
+                   VALUES (?, ?, 'post_mortem', ?, ?, ?)""",
+                (
+                    datetime.now().isoformat(), new_policy,
+                    snapshot.get("win_rate"), snapshot.get("avg_pnl_pct"), snapshot.get("sample_size")
+                )
             )
     except Exception as e:
         print(f"⚠️  Gagal simpan policy history: {e}")
@@ -359,31 +373,92 @@ Format response HARUS persis seperti ini (JSON saja, tanpa teks lain):
 def perform_post_mortem():
     """
     Analisis trade history dan update strategy policy.
-    Dijalankan otomatis setiap malam.
+    Dijalankan otomatis setiap malam, atau saat catch-up di startup.
+
+    Perbaikan dari versi sebelumnya:
+    1. Ranking pakai pnl_percent, BUKAN pnl_usdt — independen dari sizing.
+    2. Sample HANYA dari epoch config AKTIF (config.get_trading_params_fingerprint()) —
+       kalau parameter trading (SL/TP/trailing/dst) pernah berubah, data
+       dari rezim SEBELUMNYA tidak representatif untuk rezim SEKARANG.
+       Sebelumnya sampling dari SELURUH histori tanpa peduli config
+       berubah — bisa "menemukan pola" yang sebenarnya cuma artefak
+       config lama, bukan sinyal teknikal sungguhan.
+    3. Formula sample size pakai akar kuadrat (bukan linear /5) — tumbuh
+       cepat saat data masih sedikit, melandai saat data sudah banyak.
+       Di 16 trade: dulu floor di 5, sekarang ~6. Di 50 trade: ~11.
+    4. Gate agresivitas — kalau sample masih di bawah threshold (data
+       sedikit), instruksikan AI untuk HANYA menyesuaikan kecil/incremental
+       terhadap policy saat ini, bukan menulis ulang total dari nol.
+       Mencegah overfit ke kebetulan saat statistiknya masih tipis.
+    5. Snapshot performa SEBELUM update (verifikasi objektif) tetap ada,
+       terpisah dari window sampling di atas — ini soal performa SEJAK
+       teks policy terakhir ditulis, bukan soal rezim parameter.
     """
     print("\n🔬 Menjalankan Post-Mortem Analysis...")
+
+    # ── Snapshot performa SEBELUM update — window sejak TEKS POLICY
+    # terakhir ditulis (konsep beda dari epoch config di bawah) ──
+    since_iso = memory.get_last_strategy_update_time()
+    snapshot  = memory.get_performance_snapshot(since_iso=since_iso, exclude_manual=True)
+
+    if snapshot["sample_size"] == 0:
+        print("⚠️  Belum ada trade (non-manual) sejak update terakhir — skip post-mortem")
+        return
+
+    # ── Window sampling: HANYA dari epoch config AKTIF ──
+    # epoch_start diset otomatis di startup (main.py) tiap kali fingerprint
+    # parameter trading berubah. None kalau entah kenapa belum pernah
+    # tercatat sama sekali (fallback ke awal waktu, treat sebagai semua histori).
+    epoch_start = memory.get_current_config_epoch_start() or "1970-01-01T00:00:00"
+    total_in_epoch = memory.get_performance_snapshot(since_iso=epoch_start, exclude_manual=True)["sample_size"]
+
+    if total_in_epoch == 0:
+        print("⚠️  Belum ada trade di epoch config aktif — skip post-mortem (tunggu beberapa trade dulu)")
+        return
+
+    # ── Sample size: akar kuadrat, bukan linear ──
+    # sqrt tumbuh cepat di awal (tiap trade baru berarti banyak saat data
+    # sedikit) tapi melandai di angka besar (tambahan kecil tidak terlalu
+    # menambah informasi baru). k=1.5 dipilih supaya ~16 trade -> ~6 sampel.
+    sample_n = min(15, max(5, round(1.5 * math.sqrt(total_in_epoch))))
+
+    # ── Gate agresivitas rewrite — data sedikit = perubahan kecil saja ──
+    CONSERVATIVE_THRESHOLD = 20
+    if total_in_epoch < CONSERVATIVE_THRESHOLD:
+        aggressiveness_note = f"""
+⚠️  PENTING — DATA MASIH SEDIKIT ({total_in_epoch} trade sejak parameter
+trading terakhir berubah): dengan sample sekecil ini, pola yang kelihatan
+BISA JADI KEBETULAN, bukan sinyal sungguhan. JANGAN tulis ulang seluruh
+policy dari nol. PERTAHANKAN poin-poin yang masih masuk akal dari policy
+saat ini, dan HANYA ubah/tambah poin yang punya bukti SANGAT jelas dari
+data di bawah. Kalau ragu, jangan ubah apa-apa di poin itu.
+"""
+    else:
+        aggressiveness_note = ""
 
     with memory.get_db() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT symbol, side, pnl_usdt, pnl_percent,
                    close_reason, rsi_at_entry, macd_at_entry,
                    volume_spike, duration_mins, ai_reasoning
             FROM trade_history
-            WHERE status = 'CLOSED' AND pnl_usdt > 0 AND close_reason != 'MANUAL'
-            ORDER BY pnl_usdt DESC LIMIT 5
-        """)
+            WHERE status = 'CLOSED' AND pnl_percent > 0 AND close_reason != 'MANUAL'
+              AND close_timestamp >= ?
+            ORDER BY pnl_percent DESC LIMIT {sample_n}
+        """, (epoch_start,))
         winners = [dict(row) for row in cursor.fetchall()]
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT symbol, side, pnl_usdt, pnl_percent,
                    close_reason, rsi_at_entry, macd_at_entry,
                    volume_spike, duration_mins, ai_reasoning
             FROM trade_history
-            WHERE status = 'CLOSED' AND pnl_usdt < 0 AND close_reason != 'MANUAL'
-            ORDER BY pnl_usdt ASC LIMIT 5
-        """)
+            WHERE status = 'CLOSED' AND pnl_percent < 0 AND close_reason != 'MANUAL'
+              AND close_timestamp >= ?
+            ORDER BY pnl_percent ASC LIMIT {sample_n}
+        """, (epoch_start,))
         losers = [dict(row) for row in cursor.fetchall()]
 
     if not winners and not losers:
@@ -394,18 +469,22 @@ def perform_post_mortem():
 
     prompt = f"""
 Kamu adalah quant trading strategist. Analisis trade history bot ini dan update strategy policy.
-
+{aggressiveness_note}
 === POLICY SAAT INI ===
 {current_policy}
 
-=== 5 TRADE TERBAIK ===
+=== PERFORMA SEJAK POLICY INI DIPAKAI ===
+Win rate: {snapshot['win_rate']}% | Avg PnL: {snapshot['avg_pnl_pct']}% | Sampel: {snapshot['sample_size']} trade
+
+=== {len(winners)} TRADE TERBAIK (urut berdasarkan % pergerakan, bukan nominal dolar) ===
 {json.dumps(winners, indent=2)}
 
-=== 5 TRADE TERBURUK ===
+=== {len(losers)} TRADE TERBURUK (urut berdasarkan % pergerakan, bukan nominal dolar) ===
 {json.dumps(losers, indent=2)}
 
 === TUGASMU ===
-Berdasarkan pola dari trade terbaik dan terburuk:
+Berdasarkan pola dari trade terbaik dan terburuk DI ATAS, plus performa
+policy saat ini:
 1. Identifikasi pola yang menghasilkan profit (RSI berapa, MACD bagaimana, volume seperti apa)
 2. Identifikasi pola yang menyebabkan loss (kondisi apa yang harus dihindari)
 3. Tulis strategy policy baru yang lebih baik dari sebelumnya
@@ -427,8 +506,12 @@ Jawab HANYA dengan policy baru saja, tanpa penjelasan tambahan.
         return
 
     new_policy = ai["content"]
-    update_strategy_policy(new_policy)
+    update_strategy_policy(new_policy, snapshot=snapshot)
     print(f"✅ Strategy policy diupdate (via {ai['provider']})")
+    print(f"   Sampel dianalisis: {len(winners)} winner + {len(losers)} loser (dari {total_in_epoch} trade di epoch config aktif)")
+    print(f"   Performa policy sebelumnya: WR {snapshot['win_rate']}%, avg PnL {snapshot['avg_pnl_pct']}%")
+    if total_in_epoch < CONSERVATIVE_THRESHOLD:
+        print(f"   ⚠️  Mode konservatif aktif (< {CONSERVATIVE_THRESHOLD} trade) — AI diminta hanya ubah sedikit")
     print(f"\n📋 Policy Baru:\n{new_policy}")
 
 

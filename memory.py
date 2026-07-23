@@ -1,6 +1,6 @@
 import sqlite3
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from contextlib import contextmanager
 
 DB_PATH = "bot_memory.db"
@@ -85,6 +85,18 @@ def init_db():
             )
         """)
 
+        # Tabel: Config epoch — catat kapan parameter TRADING terakhir
+        # berubah (fingerprint dari config.get_trading_params_fingerprint()).
+        # Post-mortem pakai ini supaya sampling winner/loser tidak
+        # mencampur data dari rezim SL/TP/trailing yang berbeda-beda.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS config_epochs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                fingerprint TEXT NOT NULL
+            )
+        """)
+
         # Tabel 4: Scanner log — token yang pernah dianalisis
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS scan_log (
@@ -114,6 +126,52 @@ def init_db():
         ]:
             try:
                 cursor.execute(f"ALTER TABLE trade_history ADD COLUMN {column_def}")
+            except sqlite3.OperationalError:
+                pass  # kolom sudah ada dari init_db() sebelumnya
+
+        # ── Migrasi close_timestamp ──
+        # SEBELUMNYA: semua query "hari ini"/"sejak tanggal X" (get_daily_pnl,
+        # get_symbol_sl_count_today, dst) filter pakai `timestamp` (waktu
+        # OPEN posisi), bukan waktu CLOSE. Bug nyata: posisi yang dibuka
+        # 23:50 dan close 00:30 (lewat tengah malam) PnL-nya tercatat ke
+        # tanggal KEMARIN — bisa lolos dari gerbang MAX_DAILY_LOSS untuk
+        # kedua hari sekaligus (tidak masuk hitungan "hari ini" karena
+        # tanggalnya kemarin, tidak masuk hitungan "kemarin" karena saat
+        # itu masih OPEN). Sekarang ada kolom close_timestamp eksplisit,
+        # diisi PERSIS saat close terjadi (lihat save_trade_close()).
+        try:
+            cursor.execute("ALTER TABLE trade_history ADD COLUMN close_timestamp TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # kolom sudah ada
+
+        # Backfill baris CLOSED lama yang belum punya close_timestamp,
+        # pakai pendekatan lama (entry + duration_mins) sebagai perkiraan
+        # terbaik — sekali jalan, tidak menimpa yang sudah terisi.
+        # replace(...,' ','T'): SQLite datetime() pakai spasi sebagai
+        # pemisah, tapi semua timestamp yang ditulis Python pakai 'T'
+        # (dari .isoformat()) — format harus SAMA, karena perbandingan
+        # tanggal di query lain (DATE(), >=) berbasis string lexicographic.
+        cursor.execute("""
+            UPDATE trade_history
+            SET close_timestamp = replace(
+                datetime(timestamp, '+' || duration_mins || ' minutes'), ' ', 'T'
+            )
+            WHERE status = 'CLOSED' AND close_timestamp IS NULL
+        """)
+
+        # ── Migrasi kolom baru untuk verifikasi post-mortem ──
+        # Sebelumnya strategy_log cuma simpan teks policy — tidak ada cara
+        # objektif untuk cek apakah policy versi baru BENAR lebih baik dari
+        # sebelumnya. Kolom ini menyimpan snapshot performa SEBELUM update
+        # terjadi, supaya bisa dibandingkan dengan performa SETELAHNYA nanti
+        # (window sejak update ini sampai update berikutnya).
+        for column_def in [
+            "win_rate_before REAL DEFAULT NULL",
+            "avg_pnl_pct_before REAL DEFAULT NULL",
+            "sample_size INTEGER DEFAULT NULL",
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE strategy_log ADD COLUMN {column_def}")
             except sqlite3.OperationalError:
                 pass  # kolom sudah ada dari init_db() sebelumnya
 
@@ -180,14 +238,15 @@ def save_trade_close(
     with get_db() as conn:
         conn.execute("""
             UPDATE trade_history SET
-                exit_price    = ?,
-                pnl_usdt      = ?,
-                pnl_percent   = ?,
-                status        = 'CLOSED',
-                close_reason  = ?,
-                duration_mins = ?
+                exit_price      = ?,
+                pnl_usdt        = ?,
+                pnl_percent     = ?,
+                status          = 'CLOSED',
+                close_reason    = ?,
+                duration_mins   = ?,
+                close_timestamp = ?
             WHERE id = ?
-        """, (exit_price, pnl_usdt, pnl_percent, close_reason, duration_mins, trade_id))
+        """, (exit_price, pnl_usdt, pnl_percent, close_reason, duration_mins, datetime.now().isoformat(), trade_id))
 
         emoji = "✅" if pnl_usdt > 0 else "❌"
         print(f"{emoji} Trade #{trade_id} ditutup — PnL: ${pnl_usdt:.2f} ({pnl_percent:.1f}%) | Alasan: {close_reason}")
@@ -321,42 +380,57 @@ def get_current_streak() -> dict:
 
 def get_last_sl_time() -> str | None:
     """
-    Waktu CLOSE (perkiraan) dari trade terakhir yang berakhir karena SL.
+    Waktu CLOSE dari trade terakhir yang berakhir karena SL.
 
     Dipakai untuk cooldown SL yang PERSISTEN lintas restart — berbeda dari
     pendekatan lama yang menyimpan waktu di variabel Python biasa
     (last_sl_time di risk_manager.py). Variabel memori itu HILANG setiap
     kali proses bot di-restart, sehingga bot "lupa" baru saja kena SL dan
-    bisa re-entry ke symbol yang sama tanpa jeda — ini penyebab konkret
-    AIOUSDT kena SL dua kali beruntun dalam sesi testing.
+    bisa re-entry ke symbol yang sama tanpa jeda.
 
-    Karena skema trade_history tidak menyimpan timestamp CLOSE secara
-    eksplisit (hanya timestamp OPEN + duration_mins), waktu close
-    diperkirakan dari entry_time + duration_mins. Cukup akurat untuk
-    keperluan cooldown (toleransi kesalahan dalam hitungan detik, bukan
-    menit, karena duration_mins dihitung persis saat close terjadi).
+    Sekarang baca close_timestamp LANGSUNG (kolom eksplisit, diisi persis
+    saat close terjadi) — sebelumnya diperkirakan dari entry_time +
+    duration_mins karena kolom ini belum ada; sekarang lebih akurat.
 
     Return ISO timestamp, atau None kalau belum pernah ada trade SL.
     """
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT timestamp, duration_mins
+            SELECT close_timestamp
             FROM trade_history
             WHERE status = 'CLOSED' AND close_reason = 'SL'
             ORDER BY id DESC LIMIT 1
         """)
         row = cursor.fetchone()
 
-    if not row:
-        return None
+    return row["close_timestamp"] if row else None
 
-    try:
-        entry_dt = datetime.fromisoformat(row["timestamp"])
-        close_dt = entry_dt + timedelta(minutes=row["duration_mins"])
-        return close_dt.isoformat()
-    except (ValueError, TypeError):
-        return None
+def get_symbol_sl_count_today(symbol: str) -> int:
+    """
+    Berapa kali SYMBOL INI (bukan global) kena SL HARI INI.
+
+    Dipakai untuk cooldown per-symbol yang lebih tegas daripada cooldown
+    global (COOLDOWN_AFTER_SL, 15 menit semua symbol) — kalau satu symbol
+    yang SAMA sudah kena SL beberapa kali di hari yang sama (pola nyata:
+    PROMUSDT 2x SL dalam sehari), itu sinyal kuat symbol tsb sedang
+    konsisten melawan pembacaan bot, bukan cuma butuh jeda sesaat.
+
+    Filter pakai close_timestamp (bukan timestamp/waktu open) — SL yang
+    terjadi setelah tengah malam harus terhitung ke hari itu, bukan ke
+    hari saat posisinya dibuka.
+    """
+    today = date.today().isoformat()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) as cnt
+            FROM trade_history
+            WHERE symbol = ? AND close_reason = 'SL'
+              AND status = 'CLOSED' AND DATE(close_timestamp) = ?
+        """, (symbol, today))
+        row = cursor.fetchone()
+    return row["cnt"] if row else 0
 
 
 # ============================================
@@ -364,26 +438,33 @@ def get_last_sl_time() -> str | None:
 # ============================================
 
 def get_daily_pnl() -> float:
-    """Total PnL hari ini"""
+    """
+    Total PnL hari ini — dipakai gerbang MAX_DAILY_LOSS.
+
+    Filter pakai close_timestamp, BUKAN timestamp (waktu open). Sebelumnya
+    filter timestamp berarti posisi yang dibuka 23:50 dan close 00:30
+    (lewat tengah malam) PnL-nya masuk hitungan tanggal KEMARIN — bisa
+    lolos dari MAX_DAILY_LOSS untuk kedua hari sekaligus.
+    """
     today = date.today().isoformat()
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT COALESCE(SUM(pnl_usdt), 0)
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
         """, (today,))
         return cursor.fetchone()[0]
 
 def get_daily_trade_count() -> int:
-    """Jumlah trade hari ini"""
+    """Jumlah trade yang CLOSE hari ini (bukan yang dibuka hari ini)"""
     today = date.today().isoformat()
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT COUNT(*)
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
         """, (today,))
         return cursor.fetchone()[0]
 
@@ -403,7 +484,7 @@ def update_daily_summary():
                 SUM(CASE WHEN side = 'LONG' THEN 1 ELSE 0 END) as longs,
                 SUM(CASE WHEN side = 'SHORT' THEN 1 ELSE 0 END) as shorts
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
         """, (today,))
 
         row = cursor.fetchone()
@@ -489,6 +570,90 @@ def get_performance_stats() -> dict:
             "daily_pnl"     : round(get_daily_pnl(), 2),
             "daily_trades"  : get_daily_trade_count()
         }
+
+def get_performance_snapshot(since_iso: str = None, exclude_manual: bool = True) -> dict:
+    """
+    Snapshot performa ringkas (win rate, avg pnl_percent, jumlah sampel)
+    sejak `since_iso` sampai sekarang — atau sepanjang waktu kalau None.
+
+    Dipakai untuk VERIFIKASI post-mortem: simpan snapshot ini SEBELUM
+    setiap update strategy_policy, supaya nanti bisa dibandingkan dengan
+    performa SETELAH policy itu dipakai — mengecek apakah policy baru
+    BENAR memperbaiki hasil, bukan cuma diasumsikan lebih baik oleh AI.
+
+    exclude_manual: kecualikan close_reason='MANUAL' — konsisten dengan
+    perform_post_mortem() yang juga mengecualikan trade manual dari
+    pembelajaran, karena itu keputusan manusia, bukan keputusan bot.
+    """
+    where = "status = 'CLOSED'"
+    params = []
+    if since_iso:
+        where += " AND close_timestamp >= ?"
+        params.append(since_iso)
+    if exclude_manual:
+        where += " AND close_reason != 'MANUAL'"
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) as wins,
+                COALESCE(AVG(pnl_percent), 0) as avg_pnl_pct
+            FROM trade_history WHERE {where}
+        """, params)
+        row = dict(cursor.fetchone())
+
+    total = row["total"] or 0
+    wins  = row["wins"] or 0
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    return {
+        "sample_size" : total,
+        "win_rate"    : round(win_rate, 1),
+        "avg_pnl_pct" : round(row["avg_pnl_pct"], 2)
+    }
+
+def get_last_strategy_update_time() -> str | None:
+    """Waktu update strategy_policy TERAKHIR — dipakai untuk menentukan window snapshot 'before'"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT timestamp FROM strategy_log ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+    return row["timestamp"] if row else None
+
+def ensure_config_epoch(fingerprint: str) -> tuple[str, bool]:
+    """
+    Bandingkan fingerprint parameter trading SEKARANG dengan yang terakhir
+    tersimpan. Kalau beda (atau belum pernah ada sama sekali), catat epoch
+    BARU dengan timestamp sekarang — post-mortem akan sampling HANYA dari
+    trade setelah titik ini, supaya tidak mencampur data dari rezim
+    parameter yang berbeda (SL/TP/trailing yang pernah berubah beberapa kali).
+
+    Dipanggil SEKALI di startup (main.py). Return (epoch_start_iso, is_new).
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT timestamp, fingerprint FROM config_epochs ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+
+        if row and row["fingerprint"] == fingerprint:
+            return row["timestamp"], False  # tidak berubah, epoch tetap sama
+
+        now_iso = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO config_epochs (timestamp, fingerprint) VALUES (?, ?)",
+            (now_iso, fingerprint)
+        )
+        return now_iso, True
+
+def get_current_config_epoch_start() -> str | None:
+    """Waktu mulai epoch config AKTIF — None kalau belum pernah dicatat sama sekali"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT timestamp FROM config_epochs ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+    return row["timestamp"] if row else None
 
 def save_scan_log(
     symbol: str,

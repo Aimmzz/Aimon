@@ -39,6 +39,16 @@ def can_trade(symbol: str = None) -> tuple[bool, str]:
     if symbol and any(t["symbol"] == symbol for t in open_trades):
         return False, f"Sudah ada posisi terbuka di {symbol}"
 
+    # Cek 3b: Symbol ini sudah kena SL berkali-kali HARI INI — blokir
+    # sisa hari untuk symbol ini saja (bukan cooldown global di Cek 4).
+    # Beda dari Cek 3: ini TIDAK menghentikan scan kandidat lain, cuma
+    # menghindari symbol spesifik ini — lihat penanganannya di main.py
+    # (reason ini harus masuk daftar "skip symbol, lanjut scan").
+    if symbol:
+        sl_count = memory.get_symbol_sl_count_today(symbol)
+        if sl_count >= config.MAX_SL_PER_SYMBOL_PER_DAY:
+            return False, f"{symbol} sudah kena SL {sl_count}x hari ini — dihindari sisa hari"
+
     # Cek 4: Cooldown setelah stop loss — dibaca dari DATABASE, bukan
     # variabel memori, supaya cooldown-nya tahan restart.
     last_sl_iso = memory.get_last_sl_time()
@@ -265,7 +275,8 @@ def check_position_status(
     sl_price: float,
     highest_price: float,
     lowest_price: float,
-    duration_minutes: float = 0
+    duration_minutes: float = 0,
+    leverage: int = None
 ) -> dict:
     """
     Cek apakah posisi perlu ditutup
@@ -274,9 +285,18 @@ def check_position_status(
     duration_minutes dipakai HANYA untuk stagnant breaker di akhir fungsi
     (lihat bawah) — default 0 supaya pemanggilan lama tanpa argumen ini
     tetap jalan (breaker otomatis tidak aktif kalau durasi tidak dikirim).
+
+    leverage: leverage AKTUAL trade ini (dari DB) — default None jatuh ke
+    config.LEVERAGE untuk kompatibilitas mundur. Sebelumnya fungsi ini
+    SELALU pakai config.LEVERAGE global, tidak konsisten dengan
+    executor.py/main.py yang sudah pakai leverage per-trade dari DB.
+    Tidak berdampak nyata sekarang (LEVERAGE statis di config), tapi jadi
+    sumber bug diam-diam kalau nanti leverage per-trade jadi dinamis.
     """
+    lev = leverage if leverage is not None else config.LEVERAGE
+
     if side == "LONG":
-        pnl_pct = (current_price - entry_price) / entry_price * 100 * config.LEVERAGE
+        pnl_pct = (current_price - entry_price) / entry_price * 100 * lev
 
         # Cek Take Profit
         if current_price >= tp_price:
@@ -300,7 +320,7 @@ def check_position_status(
                 return {"action": "CLOSE", "reason": "TRAILING"}
 
     else:  # SHORT
-        pnl_pct = (entry_price - current_price) / entry_price * 100 * config.LEVERAGE
+        pnl_pct = (entry_price - current_price) / entry_price * 100 * lev
 
         # Cek Take Profit
         if current_price <= tp_price:

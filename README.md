@@ -63,7 +63,7 @@ scanner.py ──► indicators.py ──► [Gerbang Bias] ──► brain.py (
 - [`rich`](https://github.com/Textualize/rich) — logging berwarna, tabel ringkasan di terminal
 - [`schedule`](https://github.com/dbader/schedule) — penjadwalan 3 loop independen tanpa threading
 - `sqlite3` (built-in) — penyimpanan seluruh state bot
-- **AI**: Gemini (`gemini-3.5-flash`) sebagai provider utama, Groq (`llama-3.3-70b-versatile`) sebagai fallback — keduanya mendukung multi-key untuk menambah kuota gabungan
+- **AI**: Gemini (`gemini-3.5-flash`) sebagai provider utama, Groq (`openai/gpt-oss-120b`) sebagai fallback — keduanya mendukung multi-key untuk menambah kuota gabungan
 
 ---
 
@@ -72,8 +72,15 @@ scanner.py ──► indicators.py ──► [Gerbang Bias] ──► brain.py (
 ### Entry
 - **Gerbang bias** — AI hanya dipanggil kalau indikator sudah punya minimal 2 sinyal align (hemat 75-90% panggilan AI)
 - **Prompt dengan rubrik confidence eksplisit** (0-100, 4 tingkat) — AI wajib beri arah + confidence terpisah, bukan menghakimi sendiri "SKIP" ketika ragu
-- **Multi-provider dengan failover otomatis** — Gemini → Groq (masing-masing bisa multi-key), cooldown terpisah untuk rate-limit vs model deprecated
+- **Multi-provider dengan failover otomatis** — Gemini → Groq (masing-masing bisa multi-key), cooldown terpisah untuk rate-limit vs model deprecated. Tiap provider bisa punya konfigurasi berbeda (`supports_json_mode`, `extra_kwargs` lewat `extra_body`) — perlu karena Gemini dan Groq (GPT-OSS) sama-sama model reasoning dengan kuirk berbeda, lihat catatan di bawah.
 - **Position sizing dinamis** — persentase dari balance, di-scale oleh `allocation_pct` AI dan anti-martingale streak (menang beruntun → alokasi naik, kalah beruntun → alokasi turun)
+
+### Pembelajaran (post-mortem)
+- **Config epoch otomatis** — fingerprint parameter trading (`config.get_trading_params_fingerprint()`) dibandingkan tiap startup; kalau berubah (SL/TP/trailing/dst), epoch baru otomatis tercatat. Post-mortem HANYA sampling dari epoch aktif, supaya tidak mencampur data dari rezim parameter yang berbeda.
+- **Sample size akar kuadrat** (bukan linear) — tumbuh cepat saat data masih sedikit, melandai saat sudah banyak. Dicap 5-15 sampel per sisi (winner/loser).
+- **Gate agresivitas rewrite** — di bawah 20 trade dalam epoch aktif, AI diinstruksikan HANYA menyesuaikan kecil/incremental terhadap policy saat ini, bukan menulis ulang total (mencegah overfit ke kebetulan saat data masih tipis).
+- **Snapshot verifikasi** — performa (win rate, avg PnL%) SEBELUM tiap update policy disimpan ke `strategy_log`, untuk mengecek objektif apakah policy baru benar memperbaiki hasil.
+- **Catch-up di startup** — kalau belum pernah post-mortem sama sekali, atau sudah >20 jam sejak update terakhir, jalankan sebelum mulai scan. Tidak lagi bergantung sepenuhnya pada jadwal 00:00 (yang butuh proses tetap hidup persis di jam itu).
 
 ### Manajemen posisi aktif
 - **TP/SL tetap** dihitung deterministik dari `config.py`, bukan dari AI
@@ -178,6 +185,7 @@ clipboard setiap kali dijalankan: `pip install pyperclip`.
 | `REQUIRE_INDICATOR_BIAS` | Gerbang bias sebelum panggil AI |
 | `MIN_CONFIDENCE_TO_TRADE` | Threshold eksekusi (lihat catatan di bawah) |
 | `AI_PROVIDER_ORDER`, `GEMINI_MODEL`, `GROQ_MODEL` | Urutan & model provider AI |
+| `GROQ_SUPPORTS_JSON_MODE` | `False` — GPT-OSS di Groq punya masalah dikenal dengan `response_format=json_object` (lihat catatan di bawah) |
 | `KNOWN_DEAD_GEMINI_MODELS` | Guard startup — cegah pakai model yang diketahui mati/dibatasi |
 | `TOP_GAINER_LIMIT`, `MIN_VOLUME_24H`, `SCAN_WORKERS` | Cakupan & paralelisasi scan |
 
@@ -186,44 +194,58 @@ semua order disimulasikan lokal, TIDAK ada order asli ke Binance.
 
 ---
 
-## Status Eksperimen Saat Ini
+## Status & Backlog Perbaikan
 
-Sedang berjalan: **uji 1 minggu dengan parameter dibekukan** — jangan
-ubah `config.py` apapun sampai periode ini selesai, supaya hasilnya bisa
-dievaluasi secara bersih (lihat `daily_report.py --since-experiment`).
+**Fase saat ini: membangun & memperbaiki kualitas dulu, bukan menjalankan
+eksperimen terkontrol.** Eksperimen "1 minggu parameter dibekukan" yang
+sempat dimulai dijeda — begitu ada temuan yang jelas layak diperbaiki,
+langsung dikerjakan alih-alih ditahan sampai periode uji selesai.
+Eksperimen terkontrol akan dimulai lagi dari awal begitu kualitas bot
+dirasa sudah cukup matang (`daily_report.py --start-experiment` reset
+penanda kapan saja).
 
-Parameter yang dibekukan:
-- `MIN_CONFIDENCE_TO_TRADE = 0.60`
+Parameter risk/trading saat ini (bisa berubah lebih sering selama fase ini):
+- `MIN_CONFIDENCE_TO_TRADE = 0.70`
 - `STOP_LOSS_PCT = 1.5`, `TAKE_PROFIT_PCT = 3.0`
 - `TRAILING_STOP_ACTIVATION = 1.0`, `TRAILING_STOP_CALLBACK = 0.5`
 - `MAX_HOLD_MINUTES = 60`, `STAGNANT_PNL_BAND_PCT = 2.0`
 - `THESIS_REVIEW_INTERVAL_MINUTES = 10`, `THESIS_REVIEW_MIN_CONFIDENCE = 0.65`
 
-### Temuan yang disimpan untuk evaluasi akhir minggu (belum ditindaklanjuti)
+Setiap kali parameter di atas berubah, **config epoch baru otomatis
+tercatat** di startup (lihat subsection Pembelajaran di atas) — post-mortem
+otomatis menyesuaikan, tidak perlu langkah manual (arsip DB manual masih
+disarankan untuk reset bersih total, tapi tidak lagi wajib).
 
-1. **Re-entry ke pair yang baru saja kena SL di hari yang sama** —
-   pernah terjadi pada PROMUSDT (2x SL, total -$12.76) dan 1000XECUSDT
-   (2x, net -$4.80). Cooldown SL saat ini global (15 menit, semua
-   symbol), bukan per-symbol. Pertimbangkan cooldown lebih panjang
-   khusus untuk symbol yang sama kalau pola ini konsisten muncul.
+### Backlog dari temuan nyata (belum semua dikerjakan)
+
+1. ✅ **Re-entry ke pair yang baru saja kena SL di hari yang sama** —
+   SUDAH DIPERBAIKI. `MAX_SL_PER_SYMBOL_PER_DAY = 2` di `config.py` —
+   symbol yang kena SL 2x di hari yang sama diblokir dari entry baru
+   untuk sisa hari itu (`memory.get_symbol_sl_count_today()` +
+   `risk_manager.can_trade()` Cek 3b). Cooldown global 15 menit
+   (`COOLDOWN_AFTER_SL`) tetap berlaku terpisah untuk semua symbol.
 2. **Thesis review konsisten `HOLD` pada posisi yang memburuk perlahan
-   tapi pasti** — kasus ONEUSDT: PnL menurun bertahap dari -1.4% sampai
-   akhirnya SL di -9.6%, tapi setiap review sepanjang perjalanan itu
-   selalu `HOLD` (beda dengan USUSDT yang berhasil `TIGHTEN_SL` saat
-   tesis terbalik jelas). Dugaan: `THESIS_REVIEW_MIN_CONFIDENCE = 0.65`
-   kurang sensitif untuk pola "perlahan tapi pasti" dibanding pola
-   "tiba-tiba terbalik". Kalau berulang, pertimbangkan turunkan
-   threshold atau tambah aturan berbasis tren PnL (bukan cuma sinyal
+   tapi pasti** — kasus ONEUSDT: PnL menurun bertahap sampai akhirnya
+   SL, tapi setiap review sepanjang perjalanan itu selalu `HOLD`.
+   `THESIS_REVIEW_MIN_CONFIDENCE = 0.65` kemungkinan kurang sensitif
+   untuk pola "perlahan tapi pasti" dibanding "tiba-tiba terbalik".
+   Pertimbangkan tambah aturan berbasis TREN PnL (bukan cuma sinyal
    teknikal) di `make_thesis_review`.
+3. 🟡 **Post-mortem belum FULLY closed-loop** — SEBAGIAN dikerjakan:
+   sampling sekarang per-epoch config + formula akar kuadrat + gate
+   konservatif di data sedikit + snapshot performa sebelum tiap update
+   (lihat subsection Pembelajaran). Yang MASIH belum ada: mekanisme
+   otomatis yang menolak/revert policy baru kalau ternyata performanya
+   lebih buruk dari snapshot sebelumnya — saat ini masih perlu dicek
+   manual dari `strategy_log`.
 
 ---
 
 ## Hal-hal Penting untuk Diingat
 
-- **`MIN_CONFIDENCE_TO_TRADE`** sempat diturunkan ke 0.40 untuk fase
-  belajar awal (lebih banyak data untuk post-mortem), lalu dinaikkan
-  lagi ke 0.60 dan dibekukan untuk uji 1 minggu — lihat
-  [Status Eksperimen Saat Ini](#status-eksperimen-saat-ini) untuk
+- **`MIN_CONFIDENCE_TO_TRADE`** sudah beberapa kali disetel ulang selama
+  fase belajar (0.40 → 0.60 → 0.70 saat ini) — lihat
+  [Status & Backlog Perbaikan](#status--backlog-perbaikan) untuk nilai
   parameter lengkap dan progress terkini.
 - **PAPER mode tidak punya order stop asli di exchange** — SL/TP/trailing
   murni hasil polling bot sendiri. Ini kenapa monitoring posisi harus di
@@ -234,10 +256,26 @@ Parameter yang dibekukan:
   dibatasi untuk API key baru). `KNOWN_DEAD_GEMINI_MODELS` di `config.py`
   membantu deteksi dini, tapi cek berkala tetap perlu ke
   [halaman deprecation Gemini](https://ai.google.dev/gemini-api/docs/deprecations).
-- **Gemini 3.5 Flash punya "thinking" tersembunyi** (default level medium)
-  yang ikut memotong `max_tokens` — kalau tiba-tiba banyak respons kosong
-  (`finish_reason: length`), ini penyebabnya. Sudah dimitigasi dengan
-  `reasoning_effort: "low"` di `ai_providers.py`.
+- **Model reasoning (Gemini 3.5 Flash, GPT-OSS di Groq) sama-sama
+  punya "thinking" tersembunyi** yang ikut memotong `max_tokens` sebelum
+  sempat menulis jawaban — gejalanya respons kosong/`finish_reason: length`.
+  Gemini defaultnya level "medium", GPT-OSS juga "medium". Dimitigasi
+  dengan `reasoning_effort: "low"` untuk keduanya (Groq juga ditambah
+  `include_reasoning: False`) di `ai_providers.py`.
+- **GPT-OSS di Groq TIDAK kompatibel dengan `response_format=json_object`**
+  — validator JSON sisi server Groq terlalu ketat untuk model ini, sering
+  gagal dengan HTTP 400 "Failed to generate/validate JSON" (dikonfirmasi
+  laporan serupa di forum komunitas Groq). Solusi: `GROQ_SUPPORTS_JSON_MODE
+  = False` di `config.py` — tetap minta JSON lewat instruksi prompt +
+  parsing manual (resilient, sudah ada sejak awal untuk kasus JSON Gemini
+  yang kadang rusak).
+- **Parameter custom provider (reasoning_effort, include_reasoning, dll)
+  HARUS lewat `extra_body`, bukan kwarg langsung** — beberapa nama
+  kebetulan dikenal signature SDK `openai` (`reasoning_effort`, karena
+  dipakai juga model reasoning OpenAI sendiri) tapi yang lain murni
+  ekstensi provider (`include_reasoning` punya Groq) dan akan ditolak
+  `TypeError` kalau dikirim sebagai kwarg langsung. `extra_body` aman
+  untuk keduanya — lihat `Provider.extra_kwargs` di `ai_providers.py`.
 - **Multi-key Gemini/Groq** — arsitektur mendukung, tapi ToS kedua
   provider pada dasarnya melarang penggunaan untuk *menghindari* rate
   limit. Aman kalau memang key milik sendiri dari akun berbeda; tetap
@@ -248,7 +286,7 @@ Parameter yang dibekukan:
 
 ---
 
-## Belum Dikerjakan / Diketahui Perlu Perbaikan
+## Belum Dikerjakan — Kesiapan Live Mode
 
 - **Rekonsiliasi state saat LIVE mode** — kalau order TP/SL ter-fill di
   exchange, bot belum otomatis mendeteksi dan menutup record di database.

@@ -6,7 +6,7 @@ from memory import get_db, init_db
 EXPERIMENT_MARK_FILE = "experiment_start.txt"
 
 # ============================================
-# LAPORAN HARIAN (tidak berubah dari sebelumnya)
+# LAPORAN HARIAN
 # ============================================
 
 def generate_report() -> str:
@@ -17,7 +17,9 @@ def generate_report() -> str:
     with get_db() as conn:
         cursor = conn.cursor()
 
-        # ── Stats hari ini ──
+        # ── Stats hari ini ── (filter close_timestamp: trade yang CLOSE
+        # hari ini, bukan yang DIBUKA hari ini — posisi yang dibuka
+        # 23:50 dan close 00:30 harus terhitung ke hari closenya)
         cursor.execute("""
             SELECT
                 COUNT(*) as total,
@@ -28,7 +30,7 @@ def generate_report() -> str:
                 COALESCE(MIN(pnl_usdt), 0) as worst,
                 COALESCE(AVG(duration_mins), 0) as avg_dur
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
         """, (today,))
         today_stats = dict(cursor.fetchone())
 
@@ -47,7 +49,7 @@ def generate_report() -> str:
         cursor.execute("""
             SELECT close_reason, COUNT(*) as count
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
             GROUP BY close_reason
         """, (today,))
         reasons = dict(cursor.fetchall())
@@ -56,7 +58,7 @@ def generate_report() -> str:
         cursor.execute("""
             SELECT symbol, side, pnl_usdt, pnl_percent, close_reason, duration_mins
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
             ORDER BY pnl_usdt DESC LIMIT 1
         """, (today,))
         best_row = cursor.fetchone()
@@ -64,26 +66,27 @@ def generate_report() -> str:
         cursor.execute("""
             SELECT symbol, side, pnl_usdt, pnl_percent, close_reason, duration_mins
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
             ORDER BY pnl_usdt ASC LIMIT 1
         """, (today,))
         worst_row = cursor.fetchone()
 
         # ── SEMUA pair yang ditradingkan hari ini ──
-        # Sebelumnya ada LIMIT 5 dan ORDER BY count — dengan sebagian
-        # besar pair cuma ditradingkan 1x/hari, urutan by count jadi
-        # sewenang-wenang dan pair lain "hilang" dari laporan. Sekarang
-        # tampilkan SEMUA, diurutkan dari yang paling untung ke paling rugi.
+        # Tanpa LIMIT — sebelumnya ada LIMIT 5 + ORDER BY count yang
+        # menyembunyikan pair lain (sebagian besar pair cuma ditradingkan
+        # 1x/hari, jadi urutan by count jadi sewenang-wenang). Sekarang
+        # tampilkan semua, diurutkan dari yang paling untung ke paling rugi.
         cursor.execute("""
             SELECT symbol, COUNT(*) as count, SUM(pnl_usdt) as total_pnl
             FROM trade_history
-            WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+            WHERE DATE(close_timestamp) = ? AND status = 'CLOSED'
             GROUP BY symbol
             ORDER BY total_pnl DESC
         """, (today,))
         top_pairs = cursor.fetchall()
 
-        # ── Scan stats ──
+        # ── Scan stats (berdasarkan kapan SCAN terjadi, bukan trade
+        # open/close — jadi TETAP pakai timestamp biasa, ini benar) ──
         cursor.execute("""
             SELECT
                 COUNT(*) as total_scanned,
@@ -181,11 +184,6 @@ def generate_report() -> str:
 # ============================================
 # MODE EVALUASI EKSPERIMEN (parameter dibekukan)
 # ============================================
-# Tujuan: mengevaluasi periode uji (misal "confidence 60% selama 1 minggu")
-# secara objektif — difilter dari tanggal MULAI eksperimen, dan fokus pada
-# breakdown close_reason (bukan cuma win rate), karena angka mentah win
-# rate tidak membedakan APAKAH kegagalannya dari kualitas sinyal (SL),
-# stagnasi (STAGNANT), pembalikan tesis (THESIS_INVALID), atau hal lain.
 
 def mark_experiment_start():
     """Catat waktu SEKARANG sebagai awal periode eksperimen (parameter dibekukan)"""
@@ -206,9 +204,11 @@ def _read_experiment_start() -> str:
 def generate_range_report(start_iso: str, label: str = None) -> str:
     """
     Laporan untuk rentang waktu SEJAK start_iso sampai sekarang.
-    Fokus utama: breakdown close_reason dengan avg PnL per alasan —
-    ini yang membedakan "confidence-nya salah" vs "stagnant breaker
-    kepotong terlalu agresif" vs "trailing kepotong terlalu ketat", dll.
+    Fokus utama: breakdown close_reason dengan avg PnL per alasan.
+
+    Filter pakai close_timestamp (waktu CLOSE), bukan timestamp (waktu
+    OPEN) — trade yang closenya masuk window ini harus terhitung, biarpun
+    dibuka sedikit sebelum start_iso.
     """
     label = label or f"Sejak {start_iso[:16]}"
 
@@ -225,14 +225,11 @@ def generate_range_report(start_iso: str, label: str = None) -> str:
                 COALESCE(MAX(pnl_usdt), 0) as best,
                 COALESCE(MIN(pnl_usdt), 0) as worst
             FROM trade_history
-            WHERE timestamp >= ? AND status = 'CLOSED'
+            WHERE close_timestamp >= ? AND status = 'CLOSED'
         """, (start_iso,))
         stats = dict(cursor.fetchone())
 
         # ── Breakdown close_reason: count + avg pnl + win rate PER alasan ──
-        # Ini bagian paling penting — dari sini kelihatan apakah kerugian
-        # datang dari SL (kualitas sinyal), STAGNANT (parameter breaker
-        # kurang pas), TRAILING (callback kurang/kelebihan ketat), dst.
         cursor.execute("""
             SELECT
                 close_reason,
@@ -241,13 +238,14 @@ def generate_range_report(start_iso: str, label: str = None) -> str:
                 COALESCE(AVG(pnl_usdt), 0) as avg_pnl,
                 SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) as wins
             FROM trade_history
-            WHERE timestamp >= ? AND status = 'CLOSED'
+            WHERE close_timestamp >= ? AND status = 'CLOSED'
             GROUP BY close_reason
             ORDER BY count DESC
         """, (start_iso,))
         reason_rows = [dict(r) for r in cursor.fetchall()]
 
-        # ── Distribusi confidence (dari scan_log, untuk cek kalibrasi AI) ──
+        # ── Distribusi confidence (dari scan_log — event scan, bukan
+        # trade open/close, jadi tetap pakai timestamp biasa) ──
         cursor.execute("""
             SELECT
                 COUNT(*) as total_scanned,
@@ -260,11 +258,11 @@ def generate_range_report(start_iso: str, label: str = None) -> str:
         """, (start_iso,))
         scan_stats = dict(cursor.fetchone())
 
-        # ── Top & worst pair ──
+        # ── Worst pair ──
         cursor.execute("""
             SELECT symbol, COUNT(*) as count, SUM(pnl_usdt) as total_pnl
             FROM trade_history
-            WHERE timestamp >= ? AND status = 'CLOSED'
+            WHERE close_timestamp >= ? AND status = 'CLOSED'
             GROUP BY symbol
             ORDER BY total_pnl ASC LIMIT 5
         """, (start_iso,))
@@ -339,9 +337,7 @@ def generate_range_report(start_iso: str, label: str = None) -> str:
 def generate_full_history() -> str:
     """
     List SETIAP trade yang pernah tercatat (OPEN maupun CLOSED), urut dari
-    yang PALING BARU. Beda dengan generate_range_report() yang meringkas
-    jadi statistik agregat — ini menampilkan baris per baris, untuk kamu
-    scroll/cek trade tertentu secara individual.
+    yang PALING BARU.
     """
     with get_db() as conn:
         cursor = conn.cursor()

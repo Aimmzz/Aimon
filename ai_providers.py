@@ -24,7 +24,7 @@ import config
 # ============================================
 
 class Provider:
-    def __init__(self, name: str, api_key: str, base_url: str, model: str, extra_kwargs: dict = None):
+    def __init__(self, name: str, api_key: str, base_url: str, model: str, extra_kwargs: dict = None, supports_json_mode: bool = True):
         self.name           = name
         self.model          = model
         self.api_key        = api_key
@@ -34,6 +34,9 @@ class Provider:
         # Parameter tambahan khusus provider ini, digabung ke tiap request.
         # Dipakai untuk reasoning_effort Gemini — lihat _build_providers().
         self.extra_kwargs   = extra_kwargs or {}
+        # False untuk provider yang response_format=json_object-nya
+        # bermasalah di server (GPT-OSS di Groq) — lihat config.GROQ_SUPPORTS_JSON_MODE
+        self.supports_json_mode = supports_json_mode
 
     @property
     def client(self) -> OpenAI:
@@ -97,6 +100,15 @@ def _build_providers():
     # key Gemini, bukan cuma yang pertama.
     gemini_extra_kwargs = {"reasoning_effort": "low"}
 
+    # GPT-OSS di Groq (20B & 120B) SAMA-SAMA punya reasoning tersembunyi
+    # defaultnya "medium" (dikonfirmasi dokumentasi resmi Groq) — token
+    # "mikir" ini ikut memotong max_tokens SEBELUM sempat menulis JSON,
+    # persis akar masalah yang sama dengan Gemini 3.5 (beda provider,
+    # gejala identik: respons kosong, finish_reason=length).
+    # include_reasoning=False: reasoning tidak usah ikut dikembalikan
+    # sama sekali di response (khusus parameter GPT-OSS/Groq).
+    groq_extra_kwargs = {"reasoning_effort": "low", "include_reasoning": False}
+
     for name in config.AI_PROVIDER_ORDER:
         if name == "gemini":
             for i, key in enumerate(config.GEMINI_API_KEYS, start=1):
@@ -112,10 +124,12 @@ def _build_providers():
             for i, key in enumerate(config.GROQ_API_KEYS, start=1):
                 label = "groq" if i == 1 else f"groq{i}"
                 _providers[label] = Provider(
-                    name     = label,
-                    api_key  = key,
-                    base_url = config.GROQ_BASE_URL,
-                    model    = config.GROQ_MODEL
+                    name               = label,
+                    api_key            = key,
+                    base_url           = config.GROQ_BASE_URL,
+                    model              = config.GROQ_MODEL,
+                    supports_json_mode = config.GROQ_SUPPORTS_JSON_MODE,
+                    extra_kwargs       = groq_extra_kwargs
                 )
 
 def get_provider_status() -> list[dict]:
@@ -218,12 +232,19 @@ def chat(
                 "temperature" : temperature,
                 "max_tokens"  : max_tokens,
             }
-            if json_mode:
+            if json_mode and provider.supports_json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
-            # Parameter tambahan khusus provider ini (misal reasoning_effort
-            # untuk Gemini) — Groq tidak punya extra_kwargs jadi tidak
-            # terpengaruh sama sekali.
-            kwargs.update(provider.extra_kwargs)
+            # Parameter tambahan khusus provider ini (reasoning_effort,
+            # include_reasoning, dll) — WAJIB lewat extra_body, BUKAN
+            # kwargs langsung. Beberapa nama kebetulan dikenal signature
+            # SDK openai (reasoning_effort, karena dipakai juga model
+            # reasoning OpenAI sendiri) tapi yang lain murni ekstensi
+            # provider (include_reasoning punya Groq) dan akan ditolak
+            # dengan TypeError kalau dikirim sebagai kwarg langsung.
+            # extra_body aman untuk KEDUANYA — selalu diteruskan apa
+            # adanya ke body request tanpa divalidasi signature client.
+            if provider.extra_kwargs:
+                kwargs["extra_body"] = provider.extra_kwargs
 
             response = provider.client.chat.completions.create(**kwargs)
 

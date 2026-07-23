@@ -67,7 +67,24 @@ KNOWN_DEAD_GEMINI_MODELS = {
 }
 
 # Groq — via endpoint OpenAI-compatible
-GROQ_MODEL    = "llama-3.3-70b-versatile"
+# Groq — via endpoint OpenAI-compatible
+# GPT-OSS 120B: model yang DISARANKAN RESMI Groq (pengumuman 17 Juni 2026)
+# menggantikan beberapa model lama (Qwen3 32B, Llama 4 Scout, Kimi K2) —
+# "exceptional reasoning performance with faster inference". Kuota harian
+# juga lebih besar dari Llama 3.3 70B (200K token/hari vs 100K), jadi ini
+# upgrade kualitas SEKALIGUS kuota, bukan trade-off.
+GROQ_MODEL    = "openai/gpt-oss-120b"
+
+# GPT-OSS (20B maupun 120B) punya masalah KOMPATIBILITAS DIKENAL dengan
+# response_format=json_object di Groq — validator JSON sisi server Groq
+# terlalu ketat untuk model reasoning-heavy ini, sering gagal validasi dan
+# return HTTP 400 "Failed to generate JSON" (dikonfirmasi laporan serupa
+# di forum komunitas Groq untuk GPT-OSS-20B, error message identik).
+# Solusinya BUKAN ganti model — matikan enforcement JSON di server,
+# tetap minta JSON lewat instruksi prompt + parsing manual di brain.py
+# (yang sudah resilient terhadap JSON gagal parse, sama seperti
+# penanganan Gemini yang kadang JSON-nya rusak).
+GROQ_SUPPORTS_JSON_MODE = False
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 # Cooldown provider saat kena rate limit (menit)
@@ -85,7 +102,7 @@ AI_TIMEOUT_SECONDS = 20
 # ada faktor negatif (biasanya trend 15m berlawanan) — win rate akan lebih
 # rendah dari biasanya. WAJIB tetap PAPER_TRADE_MODE=True selama ini aktif.
 # Naikkan lagi ke 0.60 begitu sudah cukup data trade untuk post-mortem.
-MIN_CONFIDENCE_TO_TRADE = 0.60
+MIN_CONFIDENCE_TO_TRADE = 0.70
 
 # ============================================
 # REVIEW TESIS POSISI AKTIF
@@ -200,6 +217,14 @@ MAX_DAILY_LOSS = 9.0
 # Cooldown setelah kena stop loss (menit)
 COOLDOWN_AFTER_SL = 15
 
+# ── Cooldown PER-SYMBOL (beda dari cooldown global di atas) ──
+# Kalau symbol yang SAMA sudah kena SL sebanyak ini di hari yang sama,
+# symbol tsb diblokir dari entry baru untuk SISA HARI ITU — bukan cuma
+# jeda 15 menit. Pola nyata yang jadi alasan: PROMUSDT kena SL 2x dalam
+# sehari (total -$12.76) karena cooldown global cuma menahan sesaat lalu
+# bot re-entry ke symbol yang sama lagi setelah 15 menit.
+MAX_SL_PER_SYMBOL_PER_DAY = 2
+
 # ============================================
 # SCANNER SETTINGS
 # ============================================
@@ -267,6 +292,34 @@ TESTNET_STREAM_URL = "wss://stream.binancefuture.com"
 # ============================================
 # VALIDASI
 # ============================================
+# ============================================
+# CONFIG EPOCH FINGERPRINT
+# ============================================
+# Dipakai post-mortem (brain.py) untuk tahu kapan parameter TRADING
+# terakhir berubah — supaya sampling winner/loser tidak mencampur data
+# dari rezim SL/TP/trailing yang berbeda-beda (masalah nyata: SL 2.0%→1.5%,
+# TP 4.0%→3.0%, trailing callback berubah 2x sepanjang development).
+# HANYA parameter yang mempengaruhi KARAKTERISTIK trade yang dimasukkan —
+# bukan API key, model AI, atau scanner settings (itu tidak mengubah
+# bagaimana sebuah posisi dibuka/ditutup).
+import hashlib
+
+def get_trading_params_fingerprint() -> str:
+    """Fingerprint parameter trading — berubah kalau salah satu nilai di bawah berubah"""
+    parts = [
+        LEVERAGE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+        DYNAMIC_TP_ENABLED, DYNAMIC_TP_EXTENDED, DYNAMIC_TP_RSI_THRESH,
+        TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATION, TRAILING_STOP_CALLBACK,
+        STAGNANT_BREAKER_ENABLED, MAX_HOLD_MINUTES, STAGNANT_PNL_BAND_PCT,
+        MAX_OPEN_TRADES, MAX_DAILY_LOSS, COOLDOWN_AFTER_SL, MAX_SL_PER_SYMBOL_PER_DAY,
+        MIN_CONFIDENCE_TO_TRADE, REQUIRE_INDICATOR_BIAS,
+        THESIS_REVIEW_ENABLED, THESIS_REVIEW_INTERVAL_MINUTES,
+        THESIS_REVIEW_MIN_HOLD_MINUTES, THESIS_REVIEW_MIN_CONFIDENCE,
+    ]
+    raw = "|".join(str(p) for p in parts)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
 def validate_config():
     errors   = []
     warnings = []

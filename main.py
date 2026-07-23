@@ -372,8 +372,12 @@ def bot_cycle():
 
             can, reason = risk_manager.can_trade(symbol)
             if not can:
-                if "sudah ada posisi terbuka" in reason:
-                    log(f"⏭️  {symbol} sudah open, skip", "skip")
+                # Alasan yang SPESIFIK ke symbol ini saja — skip kandidat
+                # ini, tapi tetap lanjut cek kandidat lain di cycle yang
+                # sama. Alasan lain (max daily loss, max open trades,
+                # cooldown global) menghentikan SELURUH scan cycle.
+                if "sudah ada posisi terbuka" in reason or "dihindari sisa hari" in reason:
+                    log(f"⏭️  {symbol} — {reason}", "skip")
                     continue
                 log(f"⏸️  Stop scan — {reason}", "warn")
                 break
@@ -537,7 +541,8 @@ def monitor_open_trade(trade: dict) -> dict | None:
             sl_price          = sl,
             highest_price     = high,
             lowest_price      = low,
-            duration_minutes  = running_min
+            duration_minutes  = running_min,
+            leverage          = leverage
         )
 
         # PnL unrealized
@@ -622,6 +627,42 @@ def main():
         else:
             log(f"⚠️  Provider ({p['name']}) tidak aktif — API key kosong", "warn")
 
+    # ── Config epoch — deteksi otomatis kalau parameter trading berubah ──
+    # Post-mortem (brain.py) pakai epoch_start ini supaya sampling
+    # winner/loser tidak mencampur data dari rezim SL/TP/trailing yang
+    # berbeda-beda. Tidak perlu langkah manual — cukup jalan tiap startup.
+    epoch_start, is_new_epoch = memory.ensure_config_epoch(config.get_trading_params_fingerprint())
+    if is_new_epoch:
+        log(f"⚙️  Parameter trading berubah — epoch baru dimulai, post-mortem akan sampling dari sini", "warn")
+    else:
+        log(f"⚙️  Parameter trading sama seperti sebelumnya (epoch sejak {epoch_start[:16]})", "info")
+
+    # ── Catch-up post-mortem di startup ──
+    # Jadwal 00:00 di bawah cuma jalan kalau proses bot masih HIDUP persis
+    # di jam itu — kalau bot sering di-restart (pola umum saat testing),
+    # jadwal itu bisa tidak pernah ke-trigger sama sekali, dan
+    # strategy_policy.txt tertahan default walau data trade sudah banyak.
+    # Guard ini: kalau belum pernah update SAMA SEKALI, atau sudah lebih
+    # dari 20 jam sejak update terakhir, jalankan post-mortem SEKARANG
+    # sebelum mulai scan — supaya tidak bergantung pada uptime yang
+    # kebetulan menyentuh tengah malam.
+    last_update = memory.get_last_strategy_update_time()
+    should_catchup = False
+    if last_update is None:
+        should_catchup = True
+        log("🔬 Belum pernah ada post-mortem — jalankan catch-up sekarang", "ai")
+    else:
+        try:
+            hours_since = (datetime.now() - datetime.fromisoformat(last_update)).total_seconds() / 3600
+            if hours_since >= 20:
+                should_catchup = True
+                log(f"🔬 Post-mortem terakhir {hours_since:.0f} jam lalu — jalankan catch-up sekarang", "ai")
+        except (ValueError, TypeError):
+            pass
+
+    if should_catchup:
+        run_post_mortem()
+
     # ── Jadwal cepat: monitoring posisi terbuka ──
     # Sebelumnya config.POSITION_CHECK_SECONDS ada di config.py tapi TIDAK
     # PERNAH disambungkan ke schedule manapun — posisi cuma dicek sebagai
@@ -639,10 +680,13 @@ def main():
     if config.THESIS_REVIEW_ENABLED:
         log(f"🔎 Review tesis tiap {config.THESIS_REVIEW_INTERVAL_MINUTES} menit (hold minimum {config.THESIS_REVIEW_MIN_HOLD_MINUTES} menit)", "info")
 
-    # Cycle pertama langsung
-    bot_cycle()
-
     try:
+        # Cycle pertama langsung — di dalam try yang sama supaya Ctrl+C
+        # kapan pun (termasuk di tengah cycle pertama) keluar rapi,
+        # bukan traceback mentah kayak KeyboardInterrupt pas nunggu
+        # respons HTTP dari provider AI.
+        bot_cycle()
+
         while True:
             schedule.run_pending()
             time.sleep(1)

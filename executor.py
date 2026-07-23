@@ -224,11 +224,13 @@ def close_position(
             pnl_pct  = (entry_price - exit_price) / entry_price * 100 * actual_leverage
             pnl_usdt = (entry_price - exit_price) / entry_price * actual_margin * actual_leverage
 
-        # Hitung durasi
+        # Hitung durasi — total_seconds(), BUKAN .seconds (yang wrap tiap
+        # 24 jam, bug yang sama sudah diperbaiki di main.py tapi kelewat
+        # di sini karena executor.py punya perhitungan durasi terpisah)
         try:
             entry_dt     = datetime.fromisoformat(entry_time)
-            duration_min = int((datetime.now() - entry_dt).seconds / 60)
-        except:
+            duration_min = int((datetime.now() - entry_dt).total_seconds() / 60)
+        except Exception:
             duration_min = 0
 
         print(f"   Exit     : ${exit_price}")
