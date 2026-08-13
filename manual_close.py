@@ -92,9 +92,9 @@ def main():
         print("Dibatalkan.")
         return
 
-    # qty dihitung dari margin & leverage yang tersimpan — pola yang sama
-    # dipakai di seluruh main.py/executor.py untuk trade lama
-    qty = trade["margin"] * trade["leverage"] / trade["entry_price"]
+    # qty TERSIMPAN dari saat open (pembulatan step_size sudah termasuk);
+    # fallback hitung ulang hanya untuk trade lama sebelum kolom quantity ada
+    qty = memory.get_trade_quantity(trade)
 
     result = executor.close_position(
         trade_id     = trade["id"],

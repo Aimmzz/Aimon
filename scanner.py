@@ -194,12 +194,25 @@ def get_open_positions() -> list:
 # SYMBOL INFO
 # ============================================
 
+# Cache exchange info — payload-nya BESAR (semua symbol sekaligus) dan
+# sebelumnya di-fetch ulang SETIAP kali mau entry. Isinya (precision,
+# step_size, tick_size) nyaris tidak pernah berubah — cache 6 jam aman.
+_exchange_info_cache = {"symbols": None, "fetched_at": 0}
+_EXCHANGE_INFO_TTL_SECONDS = 6 * 3600
+
 def get_symbol_info(symbol: str) -> dict:
-    """Ambil info pair — precision, min qty, dll"""
+    """Ambil info pair — precision, min qty, dll (cached, TTL 6 jam)"""
     try:
-        client   = get_client()
-        info     = client.futures_exchange_info()
-        symbols  = info["symbols"]
+        import time as _time
+        now = _time.time()
+        if (_exchange_info_cache["symbols"] is None
+                or now - _exchange_info_cache["fetched_at"] > _EXCHANGE_INFO_TTL_SECONDS):
+            client = get_client()
+            info   = client.futures_exchange_info()
+            _exchange_info_cache["symbols"]    = info["symbols"]
+            _exchange_info_cache["fetched_at"] = now
+
+        symbols = _exchange_info_cache["symbols"]
 
         for s in symbols:
             if s["symbol"] == symbol:

@@ -123,6 +123,7 @@ def init_db():
             "review_count INTEGER DEFAULT 0",
             "highest_price REAL DEFAULT NULL",
             "lowest_price REAL DEFAULT NULL",
+            "quantity REAL DEFAULT NULL",
         ]:
             try:
                 cursor.execute(f"ALTER TABLE trade_history ADD COLUMN {column_def}")
@@ -201,9 +202,18 @@ def save_trade_open(
     macd: str,
     volume_spike: bool,
     tp_price: float = 0,
-    sl_price: float = 0
+    sl_price: float = 0,
+    quantity: float = None
 ) -> int:
-    """Simpan trade yang baru dibuka, return trade_id"""
+    """
+    Simpan trade yang baru dibuka, return trade_id.
+
+    quantity: jumlah AKTUAL yang dikirim ke exchange (sudah dibulatkan
+    step_size). Disimpan supaya close_position TIDAK perlu menghitung
+    ulang dari margin*leverage/entry — hasil hitung ulang bisa beda dari
+    quantity asli akibat pembulatan step_size, dan di LIVE mode selisih
+    itu bikin order close ditolak atau menyisakan posisi pecahan.
+    """
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -212,15 +222,15 @@ def save_trade_open(
                 margin, leverage, status,
                 ai_confidence, ai_reasoning,
                 rsi_at_entry, macd_at_entry, volume_spike,
-                tp_price, sl_price, highest_price, lowest_price
-            ) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                tp_price, sl_price, highest_price, lowest_price, quantity
+            ) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.now().isoformat(),
             symbol, side, entry_price,
             margin, leverage,
             ai_confidence, ai_reasoning,
             rsi, macd, int(volume_spike),
-            tp_price, sl_price, entry_price, entry_price
+            tp_price, sl_price, entry_price, entry_price, quantity
         ))
         trade_id = cursor.lastrowid
         print(f"💾 Trade #{trade_id} dibuka — {symbol} {side} @ {entry_price} | TP {tp_price} | SL {sl_price}")
@@ -339,6 +349,19 @@ def get_open_trades() -> list:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM trade_history WHERE status = 'OPEN'")
         return [dict(row) for row in cursor.fetchall()]
+
+def get_trade_quantity(trade: dict) -> float:
+    """
+    Quantity untuk close: pakai yang TERSIMPAN saat open (akurat, sudah
+    dibulatkan step_size). Fallback hitung ulang HANYA untuk trade lama
+    yang dibuka sebelum kolom quantity ada (NULL di DB) — di PAPER mode
+    selisihnya tidak berdampak, dan begitu semua trade baru menyimpan
+    quantity, fallback ini praktis tidak terpakai lagi.
+    """
+    qty = trade.get("quantity")
+    if qty:
+        return qty
+    return trade["margin"] * trade["leverage"] / trade["entry_price"]
 
 # ============================================
 # STREAK TRACKING (untuk anti-martingale sizing)

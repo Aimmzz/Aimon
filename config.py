@@ -102,7 +102,7 @@ AI_TIMEOUT_SECONDS = 20
 # ada faktor negatif (biasanya trend 15m berlawanan) — win rate akan lebih
 # rendah dari biasanya. WAJIB tetap PAPER_TRADE_MODE=True selama ini aktif.
 # Naikkan lagi ke 0.60 begitu sudah cukup data trade untuk post-mortem.
-MIN_CONFIDENCE_TO_TRADE = 0.70
+MIN_CONFIDENCE_TO_TRADE = 0.80
 
 # ============================================
 # REVIEW TESIS POSISI AKTIF
@@ -127,7 +127,7 @@ THESIS_REVIEW_MIN_HOLD_MINUTES = 15
 # LEBIH TINGGI dari MIN_CONFIDENCE_TO_TRADE karena membatalkan tesis /
 # mengunci profit adalah tindakan lebih signifikan daripada entry biasa.
 # Di bawah ini, action apapun dari AI dipaksa jadi HOLD.
-THESIS_REVIEW_MIN_CONFIDENCE = 0.65
+THESIS_REVIEW_MIN_CONFIDENCE = 0.70
 
 # ── Gerbang bias indikator ──
 # Kalau True: AI HANYA dipanggil kalau indikator sudah menghasilkan bias
@@ -141,7 +141,7 @@ REQUIRE_INDICATOR_BIAS = True
 # ============================================
 
 # Leverage — rendah dulu, bot tidak punya intuisi seperti manusia
-LEVERAGE = 3
+LEVERAGE = 5
 
 # Margin per trade (USDT) — FALLBACK kalau dynamic sizing gagal
 MARGIN_PER_TRADE = 5.0
@@ -153,11 +153,22 @@ MARGIN_PER_TRADE = 5.0
 DYNAMIC_SIZING_ENABLED = True
 
 # Base risk per trade — persentase dari available balance
-BASE_RISK_PCT = 0.10  # 10% dari balance
+BASE_RISK_PCT = 0.25  # dinaikkan dari 0.10 — lihat catatan MIN_MARGIN_PCT di bawah
 
-# Batas margin per trade — persentase dari available balance
-MIN_MARGIN_PCT = 0.03
-MAX_MARGIN_PCT = 0.18
+# ── Disesuaikan untuk modal KECIL ($20 fase live-validasi) ──
+# MIN_MARGIN_PCT adalah FLOOR MUTLAK (di-clamp PALING TERAKHIR di
+# calculate_position_size, setelah allocation_pct AI & streak-scaling)
+# — jadi margin TIDAK PERNAH bisa turun di bawah balance x MIN_MARGIN_PCT,
+# berapa pun allocation_pct AI atau seberapa jauh streak-loss menurunkan
+# sizing. Nilai lama (3%) di balance $20 = margin $0.60 -> notional cuma
+# $1.2-1.8 di leverage 2-3x, JAUH di bawah minimum notional Binance
+# Futures (~$5) -> order akan DITOLAK exchange, makin sering justru saat
+# streak kalah (paling butuh sistem tetap bisa entry).
+# 20% dari $20 = margin $4 -> notional $8-12 di leverage 2-3x, aman di
+# atas $5 dengan buffer. SESUAIKAN LAGI kalau modal berubah signifikan —
+# angka ini di-tune untuk skala $20, bukan universal.
+MIN_MARGIN_PCT = 0.20
+MAX_MARGIN_PCT = 0.40
 
 # ── Anti-martingale (streak-based scaling) ──
 STREAK_SCALING_ENABLED = True
@@ -212,7 +223,20 @@ STAGNANT_PNL_BAND_PCT      = 2.0   # PnL leveraged dalam ±2% = "zona mati"
 MAX_OPEN_TRADES = 2
 
 # Max loss per hari (USDT)
-MAX_DAILY_LOSS = 9.0
+# ── Max loss per hari — PERSENTASE dari balance, bukan dolar absolut ──
+# Sebelumnya MAX_DAILY_LOSS = $9.0 (angka tetap), sementara position
+# sizing berbasis persentase balance. Akibatnya timpang jauh: dengan
+# balance testnet ~$2.400, margin tipikal $150 dan leverage 5x, SATU SL
+# normal = $150 x 5 x 1.5% = -$11.25 — sudah melampaui batas harian.
+# Artinya gerbang harian praktis TIDAK PERNAH sempat melindungi apa-apa
+# (kejadian nyata: PnL harian tembus -$22 tanpa perlawanan).
+# Sekarang persentase, jadi otomatis proporsional di skala balance
+# manapun — testnet besar maupun live modal kecil.
+MAX_DAILY_LOSS_PCT = 8.0
+
+# Fallback dolar absolut, dipakai HANYA kalau balance gagal difetch
+# (API error/timeout) — supaya gerbang harian tidak lumpuh total.
+MAX_DAILY_LOSS_FALLBACK = 50.0
 
 # Cooldown setelah kena stop loss (menit)
 COOLDOWN_AFTER_SL = 15
@@ -311,7 +335,7 @@ def get_trading_params_fingerprint() -> str:
         DYNAMIC_TP_ENABLED, DYNAMIC_TP_EXTENDED, DYNAMIC_TP_RSI_THRESH,
         TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATION, TRAILING_STOP_CALLBACK,
         STAGNANT_BREAKER_ENABLED, MAX_HOLD_MINUTES, STAGNANT_PNL_BAND_PCT,
-        MAX_OPEN_TRADES, MAX_DAILY_LOSS, COOLDOWN_AFTER_SL, MAX_SL_PER_SYMBOL_PER_DAY,
+        MAX_OPEN_TRADES, MAX_DAILY_LOSS_PCT, COOLDOWN_AFTER_SL, MAX_SL_PER_SYMBOL_PER_DAY,
         MIN_CONFIDENCE_TO_TRADE, REQUIRE_INDICATOR_BIAS,
         THESIS_REVIEW_ENABLED, THESIS_REVIEW_INTERVAL_MINUTES,
         THESIS_REVIEW_MIN_HOLD_MINUTES, THESIS_REVIEW_MIN_CONFIDENCE,
@@ -344,6 +368,24 @@ def validate_config():
             f"Ganti ke 'gemini-3.5-flash' di config.py sebelum lanjut."
         )
 
+    # ── Cek konsistensi batas harian vs risiko per-trade ──
+    # Semua dalam PERSEN BALANCE, jadi bisa dihitung tanpa fetch balance:
+    #   margin maksimum   = MAX_MARGIN_PCT x balance
+    #   rugi saat SL      = margin x LEVERAGE x STOP_LOSS_PCT
+    #   -> sebagai % balance = MAX_MARGIN_PCT x LEVERAGE x STOP_LOSS_PCT
+    # Kalau batas harian lebih kecil dari total kerugian posisi yang bisa
+    # terbuka BERSAMAAN, gerbang harian tidak akan pernah sempat bekerja —
+    # persis kondisi yang bikin MAX_DAILY_LOSS lama ($9) jadi tidak berguna.
+    max_single_loss_pct = MAX_MARGIN_PCT * LEVERAGE * STOP_LOSS_PCT
+    worst_case_pct      = max_single_loss_pct * MAX_OPEN_TRADES
+    if MAX_DAILY_LOSS_PCT < worst_case_pct:
+        warnings.append(
+            f"⚠️  MAX_DAILY_LOSS_PCT ({MAX_DAILY_LOSS_PCT}%) lebih kecil dari kerugian "
+            f"{MAX_OPEN_TRADES} posisi maksimum yang kena SL bersamaan ({worst_case_pct:.2f}%) — "
+            f"gerbang harian bisa tembus dalam satu kali kejadian. "
+            f"Naikkan ke minimal {worst_case_pct:.1f}%, atau turunkan LEVERAGE/MAX_MARGIN_PCT."
+        )
+
     if errors:
         for e in errors:
             print(e)
@@ -373,7 +415,7 @@ def validate_config():
         print(f"   Sizing          : 📌 STATIC (${MARGIN_PER_TRADE}/trade)")
     print(f"   Leverage        : {LEVERAGE}x")
     print(f"   Max trades      : {MAX_OPEN_TRADES}")
-    print(f"   Max loss/hari   : ${MAX_DAILY_LOSS}")
+    print(f"   Max loss/hari   : {MAX_DAILY_LOSS_PCT}% dari balance")
     print(f"📊 Risk management:")
     print(f"   Stop loss       : {STOP_LOSS_PCT}%")
     print(f"   Take profit     : {TAKE_PROFIT_PCT}%")

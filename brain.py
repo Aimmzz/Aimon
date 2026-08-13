@@ -1,6 +1,7 @@
 import json
 import os
 import math
+import difflib
 from datetime import datetime
 import config
 import memory
@@ -23,11 +24,13 @@ STRATEGY POLICY (Default — belum ada data trade):
 4. Hindari entry saat trend 15m berlawanan dengan sinyal 5m
 5. Selalu pertimbangkan risk/reward sebelum entry
 """.strip()
-        with open(STRATEGY_FILE, "w") as f:
+        tmp_path = STRATEGY_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(default)
+        os.replace(tmp_path, STRATEGY_FILE)
         return default
 
-    with open(STRATEGY_FILE, "r") as f:
+    with open(STRATEGY_FILE, "r", encoding="utf-8") as f:
         return f.read()
 
 def update_strategy_policy(new_policy: str, snapshot: dict = None):
@@ -41,8 +44,20 @@ def update_strategy_policy(new_policy: str, snapshot: dict = None):
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     content   = f"[Updated: {timestamp}]\n{new_policy}"
-    with open(STRATEGY_FILE, "w") as f:
+
+    # ── Tulis ATOMIK — tulis ke file sementara dulu, baru os.replace()
+    # menimpa file asli. os.replace() atomik di level OS (POSIX & Windows)
+    # — tidak ada momen di mana file dalam kondisi "setengah tertulis".
+    # Ini melindungi dari DUA skenario nyata: (1) proses ini sendiri
+    # diinterupsi (Ctrl+C) tepat di tengah penulisan, (2) dua proses
+    # (misal main.py + perintah manual perform_post_mortem() yang masih
+    # jalan di terminal lain) menulis ke file yang sama nyaris
+    # bersamaan — kejadian nyata yang menghasilkan file tercampur
+    # ("Versi 4.0" diikuti potongan header proses lain yang ke-cut).
+    tmp_path = STRATEGY_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(content)
+    os.replace(tmp_path, STRATEGY_FILE)
 
     # Simpan juga ke tabel strategy_log supaya history policy tidak hilang
     # (tabel ini sudah ada di memory.init_db tapi sebelumnya tidak pernah dipakai)
@@ -87,6 +102,11 @@ def make_decision(
     daily_trades = stats["daily_trades"]
     win_rate     = stats["win_rate"]
 
+    # Batas harian sekarang berbasis % balance — import lokal karena
+    # risk_manager tidak di-import di level modul file ini
+    import risk_manager
+    _max_daily_loss = risk_manager.get_max_daily_loss()
+
     prompt = f"""
 Kamu adalah AI Trading Analyst untuk Binance Futures scalping bot.
 Tugasmu: Analisis data teknikal dan putuskan apakah harus BUY (LONG), SELL (SHORT), atau SKIP.
@@ -101,8 +121,8 @@ Tugasmu: Analisis data teknikal dan putuskan apakah harus BUY (LONG), SELL (SHOR
 - Total trade hari ini : {daily_trades}
 - PnL hari ini        : ${daily_pnl:.2f}
 - Win rate keseluruhan: {win_rate}%
-- Max loss/hari       : ${config.MAX_DAILY_LOSS}
-- Sisa ruang loss     : ${config.MAX_DAILY_LOSS - abs(min(daily_pnl, 0)):.2f}
+- Max loss/hari       : ${_max_daily_loss:.2f} ({config.MAX_DAILY_LOSS_PCT}% balance)
+- Sisa ruang loss     : ${_max_daily_loss - abs(min(daily_pnl, 0)):.2f}
 
 === RISK MANAGEMENT ===
 - Leverage  : {config.LEVERAGE}x
@@ -370,6 +390,85 @@ Format response HARUS persis seperti ini (JSON saja, tanpa teks lain):
 # POST MORTEM LEARNING
 # ============================================
 
+def _apply_policy_deltas(policy_text: str, changes: list) -> tuple[str | None, int]:
+    """
+    Terapkan perubahan TERSTRUKTUR ke policy yang ada — dipakai mode
+    konservatif post-mortem. AI tidak lagi menulis policy utuh (terbukti
+    4x berturut GPT-OSS mengabaikan instruksi "ubah sedikit" dan menulis
+    ulang total); AI hanya mengisi daftar delta kecil, dan KODE yang
+    merakit hasil akhirnya — sehingga secara konstruksi hasilnya pasti
+    incremental, bukan tergantung kepatuhan model.
+
+    Operasi yang didukung (sengaja MINIM — tidak ada "hapus", model bisa
+    pakai "ubah" untuk mengganti poin yang dianggap salah):
+      {"op": "ubah",   "nomor": 3, "teks": "..."}  -> ganti isi poin #3
+      {"op": "tambah", "teks": "..."}              -> tambah poin baru di akhir
+
+    Return (policy_baru, jumlah_perubahan_diterapkan).
+    policy_baru None kalau format policy tidak bisa diparse (tidak ada
+    baris bernomor sama sekali) — pemanggil harus treat sebagai gagal.
+    """
+    import re
+    lines = policy_text.splitlines()
+
+    numbered = {}  # nomor -> index baris
+    max_num  = 0
+    last_numbered_idx = -1
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*(\d+)[\.\)]\s+", line)
+        if m:
+            num = int(m.group(1))
+            numbered[num] = i
+            max_num = max(max_num, num)
+            last_numbered_idx = i
+
+    if not numbered:
+        return None, 0
+
+    applied = 0
+    for ch in changes[:2]:  # HARD CAP 2 perubahan per run — inti mode konservatif
+        op   = str(ch.get("op", "")).strip().lower()
+        teks = str(ch.get("teks", "")).strip()
+
+        if op == "ubah":
+            try:
+                nomor = int(ch.get("nomor", 0))
+            except (TypeError, ValueError):
+                continue
+            if nomor in numbered and teks:
+                lines[numbered[nomor]] = f"{nomor}. {teks}"
+                applied += 1
+
+        elif op == "tambah":
+            if teks and max_num < 10:
+                max_num += 1
+                lines.insert(last_numbered_idx + 1, f"{max_num}. {teks}")
+                last_numbered_idx += 1
+                applied += 1
+
+    return "\n".join(lines), applied
+
+
+def _looks_like_valid_policy(text: str, min_numbered_lines: int = 3) -> bool:
+    """
+    Validasi STRUKTUR minimal sebelum sebuah teks diterima sebagai policy.
+
+    Kejadian nyata yang jadi alasan ini ada: mode normal (AI bebas
+    menulis ulang) tidak punya validasi apapun sebelumnya — AI (Gemini)
+    menulis analisis panjang dulu ("Top Trades... Bottom Trades...")
+    sebelum sampai ke policy final, lalu kehabisan max_tokens di tengah
+    jalan. Hasilnya potongan teks acak yang BUKAN policy, tapi tetap
+    diterima karena cuma dicek "tidak kosong", bukan "apakah ini
+    benar-benar policy". Sekarang wajib ada minimal N baris bernomor
+    (format yang sama dipakai _apply_policy_deltas) sebelum diterima —
+    kalau tidak, jelas ini bukan policy yang valid, apapun sebabnya
+    (terpotong, format salah, dll).
+    """
+    import re
+    numbered = [l for l in text.splitlines() if re.match(r"\s*\d+[\.\)]\s+", l)]
+    return len(numbered) >= min_numbered_lines
+
+
 def perform_post_mortem():
     """
     Analisis trade history dan update strategy policy.
@@ -403,7 +502,7 @@ def perform_post_mortem():
 
     if snapshot["sample_size"] == 0:
         print("⚠️  Belum ada trade (non-manual) sejak update terakhir — skip post-mortem")
-        return
+        return False
 
     # ── Window sampling: HANYA dari epoch config AKTIF ──
     # epoch_start diset otomatis di startup (main.py) tiap kali fingerprint
@@ -414,7 +513,7 @@ def perform_post_mortem():
 
     if total_in_epoch == 0:
         print("⚠️  Belum ada trade di epoch config aktif — skip post-mortem (tunggu beberapa trade dulu)")
-        return
+        return False
 
     # ── Sample size: akar kuadrat, bukan linear ──
     # sqrt tumbuh cepat di awal (tiap trade baru berarti banyak saat data
@@ -424,17 +523,14 @@ def perform_post_mortem():
 
     # ── Gate agresivitas rewrite — data sedikit = perubahan kecil saja ──
     CONSERVATIVE_THRESHOLD = 20
-    if total_in_epoch < CONSERVATIVE_THRESHOLD:
-        aggressiveness_note = f"""
-⚠️  PENTING — DATA MASIH SEDIKIT ({total_in_epoch} trade sejak parameter
-trading terakhir berubah): dengan sample sekecil ini, pola yang kelihatan
-BISA JADI KEBETULAN, bukan sinyal sungguhan. JANGAN tulis ulang seluruh
-policy dari nol. PERTAHANKAN poin-poin yang masih masuk akal dari policy
-saat ini, dan HANYA ubah/tambah poin yang punya bukti SANGAT jelas dari
-data di bawah. Kalau ragu, jangan ubah apa-apa di poin itu.
-"""
-    else:
-        aggressiveness_note = ""
+    # Instruksi prompt SAJA tidak cukup — model (apalagi model open-source
+    # kayak GPT-OSS) bisa saja tetap menulis ulang total meski diminta
+    # "cuma ubah sedikit" (kejadian nyata: instruksi konservatif di prompt
+    # diabaikan, seluruh 8 poin ditulis ulang dari 10 sampel). Makanya ada
+    # pengecekan MEKANIS di kode juga — similarity text minimum di mode
+    # konservatif, konsisten dengan prinsip "jangan percaya AI untuk hal
+    # yang bisa divalidasi kode" yang sudah dipakai di seluruh proyek ini.
+    CONSERVATIVE_MIN_SIMILARITY = 0.5  # 50% — di bawah ini dianggap "rewrite total"
 
     with memory.get_db() as conn:
         cursor = conn.cursor()
@@ -463,13 +559,13 @@ data di bawah. Kalau ragu, jangan ubah apa-apa di poin itu.
 
     if not winners and not losers:
         print("⚠️  Belum cukup data trade untuk post-mortem")
-        return
+        return False
 
     current_policy = load_strategy_policy()
 
-    prompt = f"""
-Kamu adalah quant trading strategist. Analisis trade history bot ini dan update strategy policy.
-{aggressiveness_note}
+    conservative = total_in_epoch < CONSERVATIVE_THRESHOLD
+
+    data_section = f"""
 === POLICY SAAT INI ===
 {current_policy}
 
@@ -481,7 +577,65 @@ Win rate: {snapshot['win_rate']}% | Avg PnL: {snapshot['avg_pnl_pct']}% | Sampel
 
 === {len(losers)} TRADE TERBURUK (urut berdasarkan % pergerakan, bukan nominal dolar) ===
 {json.dumps(losers, indent=2)}
+"""
 
+    if conservative:
+        # ── Mode konservatif: minta DELTA terstruktur, BUKAN policy utuh ──
+        # Terbukti 4x berturut GPT-OSS mengabaikan instruksi "ubah sedikit"
+        # dalam teks bebas dan tetap menulis ulang total (similarity 5-22%).
+        # Model jauh lebih patuh pada "isi format kecil ini" daripada
+        # "tulis dokumen tapi tahan diri" — jadi AI cuma mengisi daftar
+        # perubahan, dan KODE yang merakit policy barunya.
+        prompt = f"""
+Kamu adalah quant trading strategist. Data trade masih SEDIKIT ({total_in_epoch} trade
+sejak parameter trading terakhir berubah) — pola yang terlihat bisa jadi kebetulan.
+Karena itu kamu TIDAK menulis policy baru; kamu hanya boleh mengusulkan MAKSIMAL 2
+perubahan kecil pada policy yang sudah ada, ITU PUN hanya kalau ada bukti sangat
+jelas dari data di bawah. Tanpa bukti kuat: jangan usulkan apa-apa.
+{data_section}
+=== FORMAT JAWABAN (WAJIB persis, JSON saja, tanpa teks lain) ===
+{{"changes": [
+    {{"op": "ubah", "nomor": <nomor poin yang diubah>, "teks": "<isi baru poin itu>"}},
+    {{"op": "tambah", "teks": "<poin baru>"}}
+]}}
+Maksimal 2 item di "changes". Kalau tidak ada perubahan yang didukung bukti kuat,
+jawab persis: {{"changes": []}}
+"""
+        ai = ai_providers.chat(
+            system      = "Kamu adalah quant trading strategist yang sangat konservatif. Jawab HANYA JSON valid.",
+            user        = prompt,
+            temperature = 0.2,
+            max_tokens  = 400,
+            json_mode   = True
+        )
+
+        if not ai["ok"]:
+            print(f"❌ Post-mortem gagal — {ai.get('error', 'semua provider tidak tersedia')}")
+            return False
+
+        try:
+            raw = ai["content"].replace("```json", "").replace("```", "").strip()
+            changes = json.loads(raw).get("changes", [])
+        except (json.JSONDecodeError, AttributeError):
+            print(f"❌ Post-mortem DITOLAK — respons delta bukan JSON valid. Policy lama dipertahankan.")
+            return False
+
+        if not changes:
+            print(f"⏭️  Post-mortem: AI menilai belum ada perubahan yang didukung bukti kuat ({total_in_epoch} trade) — policy tetap, tidak ada yang diubah")
+            return False
+
+        new_policy, applied = _apply_policy_deltas(current_policy, changes)
+        if new_policy is None or applied == 0:
+            print(f"❌ Post-mortem DITOLAK — delta tidak bisa diterapkan (format policy/nomor tidak cocok). Policy lama dipertahankan.")
+            return False
+
+        print(f"🔧 Mode konservatif: {applied} perubahan kecil diterapkan oleh kode (bukan rewrite AI)")
+
+    else:
+        # ── Mode normal (data cukup): AI bebas menulis ulang policy utuh ──
+        prompt = f"""
+Kamu adalah quant trading strategist. Analisis trade history bot ini dan update strategy policy.
+{data_section}
 === TUGASMU ===
 Berdasarkan pola dari trade terbaik dan terburuk DI ATAS, plus performa
 policy saat ini:
@@ -492,27 +646,57 @@ policy saat ini:
 
 Jawab HANYA dengan policy baru saja, tanpa penjelasan tambahan.
 """
+        ai = ai_providers.chat(
+            system      = "Kamu adalah quant trading strategist. Jawab langsung dengan policy baru.",
+            user        = prompt,
+            temperature = 0.3,
+            max_tokens  = 900,  # dinaikkan dari 600 — kejadian nyata: AI nulis analisis panjang dulu sebelum policy, kehabisan token di tengah jalan
+            json_mode   = False
+        )
 
-    ai = ai_providers.chat(
-        system      = "Kamu adalah quant trading strategist. Jawab langsung dengan policy baru.",
-        user        = prompt,
-        temperature = 0.3,
-        max_tokens  = 600,
-        json_mode   = False   # Post-mortem output-nya teks bebas, bukan JSON
-    )
+        if not ai["ok"]:
+            print(f"❌ Post-mortem gagal — {ai.get('error', 'semua provider tidak tersedia')}")
+            return False
 
-    if not ai["ok"]:
-        print(f"❌ Post-mortem gagal — {ai.get('error', 'semua provider tidak tersedia')}")
-        return
+        new_policy = ai["content"]
 
-    new_policy = ai["content"]
+        # ── Validasi struktur — jangan cuma percaya "tidak kosong" ──
+        # Kejadian nyata: respons ai["ok"]=True tapi isinya potongan
+        # analisis, bukan policy (AI kehabisan token di tengah menulis
+        # narasi panjang sebelum sampai ke daftar bernomor).
+        if not _looks_like_valid_policy(new_policy):
+            print(
+                f"❌ Post-mortem DITOLAK — respons AI tidak terlihat seperti policy valid "
+                f"(kurang dari 3 baris bernomor, kemungkinan terpotong/format salah). "
+                f"Policy lama DIPERTAHANKAN, tidak ditimpa."
+            )
+            print(f"\n📋 Respons yang DITOLAK (untuk referensi, TIDAK disimpan):\n{new_policy}")
+            return False
+
+    # ── Jaring pengaman terakhir (mode konservatif): similarity check ──
+    # Dengan jalur delta di atas, hasil rakitan kode secara konstruksi
+    # pasti incremental — check ini praktis selalu lolos sekarang, tapi
+    # tetap dipertahankan sebagai lapisan validasi independen (prinsip:
+    # jangan percaya satu mekanisme saja untuk hal yang bisa divalidasi).
+    if conservative:
+        similarity = difflib.SequenceMatcher(None, current_policy, new_policy).ratio()
+        if similarity < CONSERVATIVE_MIN_SIMILARITY:
+            print(
+                f"❌ Post-mortem DITOLAK — mode konservatif aktif ({total_in_epoch} trade) tapi hasil akhir "
+                f"berubah terlalu besar (similarity {similarity:.0%}, minimum {CONSERVATIVE_MIN_SIMILARITY:.0%}). "
+                f"Policy lama DIPERTAHANKAN, tidak ditimpa."
+            )
+            print(f"\n📋 Policy yang DITOLAK (untuk referensi, TIDAK disimpan):\n{new_policy}")
+            return False
+
     update_strategy_policy(new_policy, snapshot=snapshot)
     print(f"✅ Strategy policy diupdate (via {ai['provider']})")
     print(f"   Sampel dianalisis: {len(winners)} winner + {len(losers)} loser (dari {total_in_epoch} trade di epoch config aktif)")
     print(f"   Performa policy sebelumnya: WR {snapshot['win_rate']}%, avg PnL {snapshot['avg_pnl_pct']}%")
-    if total_in_epoch < CONSERVATIVE_THRESHOLD:
-        print(f"   ⚠️  Mode konservatif aktif (< {CONSERVATIVE_THRESHOLD} trade) — AI diminta hanya ubah sedikit")
+    if conservative:
+        print(f"   ⚠️  Mode konservatif aktif (< {CONSERVATIVE_THRESHOLD} trade) — perubahan dibatasi delta kecil")
     print(f"\n📋 Policy Baru:\n{new_policy}")
+    return True
 
 
 if __name__ == "__main__":

@@ -4,6 +4,44 @@ import config
 import memory
 
 # ============================================
+# BATAS KERUGIAN HARIAN (berbasis % balance)
+# ============================================
+# can_trade() dipanggil BERKALI-KALI per cycle (sekali per kandidat scan),
+# jadi balance TIDAK boleh difetch tiap panggilan — di-cache pendek saja.
+# 60 detik cukup: balance tidak berubah signifikan dalam rentang itu, dan
+# tetap ikut turun/naik mengikuti hasil trade dalam hitungan menit.
+_balance_cache = {"value": 0.0, "fetched_at": 0.0}
+_BALANCE_CACHE_TTL_SECONDS = 60
+
+def _get_cached_balance() -> float:
+    now = time.time()
+    if _balance_cache["value"] <= 0 or (now - _balance_cache["fetched_at"]) > _BALANCE_CACHE_TTL_SECONDS:
+        try:
+            import scanner  # import lokal — hindari circular import di level modul
+            info = scanner.get_account_balance()
+            bal  = info.get("available_balance", 0) or info.get("balance", 0)
+            if bal > 0:
+                _balance_cache["value"]      = bal
+                _balance_cache["fetched_at"] = now
+        except Exception:
+            pass  # gagal fetch — pakai nilai cache lama / fallback di bawah
+    return _balance_cache["value"]
+
+def get_max_daily_loss() -> float:
+    """
+    Batas kerugian harian dalam DOLAR, dihitung dari persentase balance.
+
+    Dulu ini angka tetap di config ($9) sementara position sizing berbasis
+    persentase balance — timpang jauh, sampai satu SL normal saja sudah
+    melampaui batas harian. Sekarang keduanya sama-sama proporsional
+    terhadap balance, jadi konsisten di skala akun manapun.
+    """
+    balance = _get_cached_balance()
+    if balance <= 0:
+        return config.MAX_DAILY_LOSS_FALLBACK
+    return balance * config.MAX_DAILY_LOSS_PCT / 100
+
+# ============================================
 # STATE
 # ============================================
 # CATATAN: cooldown SL SEBELUMNYA disimpan di variabel Python biasa
@@ -27,8 +65,9 @@ def can_trade(symbol: str = None) -> tuple[bool, str]:
     """
     # Cek 1: Max daily loss
     daily_pnl = memory.get_daily_pnl()
-    if daily_pnl <= -config.MAX_DAILY_LOSS:
-        return False, f"Max daily loss tercapai (${daily_pnl:.2f})"
+    max_daily_loss = get_max_daily_loss()
+    if daily_pnl <= -max_daily_loss:
+        return False, f"Max daily loss tercapai (${daily_pnl:.2f} / -${max_daily_loss:.2f} = {config.MAX_DAILY_LOSS_PCT}% balance)"
 
     # Cek 2: Max open trades
     open_trades = memory.get_open_trades()
@@ -401,7 +440,7 @@ def print_risk_status():
 
     print(f"\n🛡️  RISK STATUS")
     print(f"{'='*40}")
-    print(f"Daily PnL      : ${daily_pnl:.2f} / -${config.MAX_DAILY_LOSS}")
+    print(f"Daily PnL      : ${daily_pnl:.2f} / -${get_max_daily_loss():.2f} ({config.MAX_DAILY_LOSS_PCT}% balance)")
     print(f"Daily trades   : {daily_trades}")
     print(f"Open trades    : {len(open_trades)}/{config.MAX_OPEN_TRADES}")
     print(f"Cooldown aktif : {'Ya' if cooldown_active else 'Tidak'}")

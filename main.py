@@ -260,7 +260,7 @@ def review_all_theses():
             )
 
             if action == "EXIT_EARLY":
-                qty = trade["margin"] * trade["leverage"] / trade["entry_price"]
+                qty = memory.get_trade_quantity(trade)
                 executor.close_position(
                     trade_id     = trade["id"],
                     symbol       = symbol,
@@ -448,25 +448,18 @@ def bot_cycle():
                     f"streak {sizing['streak_type']}x{sizing['streak_count']})"
                 )
 
-            tp, sl = risk_manager.calculate_tp_sl_prices(
-                side        = decision,
-                entry_price = price,
-                ai_tp       = ai_result.get("take_profit_price", 0),
-                ai_sl       = ai_result.get("stop_loss_price", 0)
-            )
-
             trade_result = executor.open_position(
                 symbol     = symbol,
                 side       = decision,
                 quantity   = qty,
                 margin     = margin,
-                tp_price   = tp,
-                sl_price   = sl,
                 ai_result  = ai_result,
                 indicators = inds
             )
 
             if trade_result["status"] == "ok":
+                tp = trade_result["tp_price"]
+                sl = trade_result["sl_price"]
                 log(f"✅ {decision} {symbol} dibuka #{trade_result['trade_id']} | TP {tp} SL {sl}", "ok")
                 memory.save_scan_log(
                     symbol=symbol, price_change=price_change,
@@ -495,7 +488,18 @@ def monitor_open_trade(trade: dict) -> dict | None:
         entry_time  = trade["timestamp"]
         margin      = trade["margin"]
         leverage    = trade["leverage"]
-        qty         = margin * leverage / entry_price
+        # Quantity TERSIMPAN dari saat open (bukan dihitung ulang) —
+        # hitung ulang bisa beda dari yang asli akibat pembulatan
+        # step_size, fatal di LIVE mode (order close ditolak/pecahan)
+        qty         = memory.get_trade_quantity(trade)
+
+        # ── Rekonsiliasi exchange ↔ DB (LIVE mode saja, no-op di PAPER) ──
+        # Di live, TP/SL adalah order asli yang dieksekusi BINANCE — bisa
+        # ter-fill saat bot polling/mati. Cek dulu posisi ini masih nyata
+        # ada sebelum mengambil keputusan apapun atasnya; kalau ternyata
+        # sudah closed di exchange, DB disinkronkan dan selesai di sini.
+        if executor.reconcile_trade_with_exchange(trade):
+            return None
 
         stored_tp = trade.get("tp_price") or 0
         stored_sl = trade.get("sl_price") or 0
@@ -598,8 +602,11 @@ def monitor_open_trade(trade: dict) -> dict | None:
 
 def run_post_mortem():
     log("🔬 Menjalankan post-mortem analysis...", "ai")
-    brain.perform_post_mortem()
-    log("✅ Strategy policy diupdate", "ok")
+    success = brain.perform_post_mortem()
+    if success:
+        log("✅ Strategy policy diupdate", "ok")
+    else:
+        log("⏭️  Post-mortem di-skip (belum cukup data baru / gagal AI) — policy TIDAK berubah", "warn")
 
 # ============================================
 # MAIN

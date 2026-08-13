@@ -109,7 +109,7 @@ def generate_report() -> str:
 
         # ── Strategy policy ──
         try:
-            with open("strategy_policy.txt", "r") as f:
+            with open("strategy_policy.txt", "r", encoding="utf-8") as f:
                 policy = f.read().strip()
         except Exception:
             policy = "Belum ada policy"
@@ -188,14 +188,14 @@ def generate_report() -> str:
 def mark_experiment_start():
     """Catat waktu SEKARANG sebagai awal periode eksperimen (parameter dibekukan)"""
     now_iso = datetime.now().isoformat()
-    with open(EXPERIMENT_MARK_FILE, "w") as f:
+    with open(EXPERIMENT_MARK_FILE, "w", encoding="utf-8") as f:
         f.write(now_iso)
     print(f"✅ Eksperimen ditandai mulai: {now_iso}")
     print(f"   (tersimpan di {EXPERIMENT_MARK_FILE} — jalankan --since-experiment nanti untuk evaluasi)")
 
 def _read_experiment_start() -> str:
     try:
-        with open(EXPERIMENT_MARK_FILE, "r") as f:
+        with open(EXPERIMENT_MARK_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except FileNotFoundError:
         print(f"❌ Belum ada eksperimen ditandai. Jalankan dulu: python daily_report.py --start-experiment")
